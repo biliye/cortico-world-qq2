@@ -1,0 +1,27 @@
+{
+  // Node 侧代码(World 与定义)。控制台面板(src/webui/**)是浏览器侧的 TS,
+  // 由 tsconfig.web.json 单独查(那里有 DOM)。
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    // 开发期把 `cortico/*` 指到平级的框架 checkout;装进宿主运行时不靠它,
+    // 那时由框架 `src/extensions/runtime.ts` 的模块钩子解析。本包住在 Cortina 工作区的
+    // state/packages/ 下,框架 clone 在 state/cortico/,所以是往回两级。
+    "paths": {
+      "cortico/*": ["../../cortico/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/webui"]
+}

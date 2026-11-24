@@ -1,0 +1,450 @@
+/**
+ * 入站文件与语音:嗅探、渲染、文件库,以及「一条 QQ 文件消息真的走到推送点」的真回路。
+ *
+ * 为什么单测之外还要一层真回路:单测只验了纯函数与库,验不到「段被替换、正文里真有内容、
+ * 编号真落盘、工具真读得回来」。上一轮的教训(见设计记录「按住说话」那节)是:
+ * 要验一条路,就用那条路自己灌一次已知输入。
+ */
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createServer, type Server } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { nullLogger } from 'cortico/core/util.ts';
+import type { EventEnvelope, PushOptions, WorldHost } from 'cortico/core/types.ts';
+import { ASR_DEFAULTS, FILES_DEFAULTS, type QQFilesConfig } from '../src/config.ts';
+import { FileLibrary, formatBytes, renderFileText, sniffText } from '../src/files.ts';
+import { renderTranscription } from '../src/asr.ts';
+import { MockNapCat } from './helpers/mock-napcat.ts';
+import { QQ2World } from '../src/world.ts';
+
+// ————— 纯函数 —————
+
+const utf8 = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, 'utf8'));
+
+describe('判文本还是二进制', () => {
+  it('UTF-8 中文认成文本', () => {
+    expect(sniffText(utf8('哈喽哈喽\n第二行'))).toEqual({ kind: 'text', text: '哈喽哈喽\n第二行', encoding: 'utf-8' });
+  });
+
+  it('GBK 中文也认(Windows 记事本存的旧文件就是这一档)', () => {
+    // 「你好」的 GBK 字节
+    const got = sniffText(new Uint8Array([0xc4, 0xe3, 0xba, 0xc3]));
+    expect(got.kind).toBe('text');
+    expect(got).toMatchObject({ encoding: 'gbk' });
+    expect((got as { text: string }).text).toBe('你好');
+  });
+
+  it('带 BOM 的 UTF-8 走 BOM 那条路(BOM 本身不进正文)', () => {
+    const bytes = new Uint8Array([0xef, 0xbb, 0xbf, ...utf8('嗯')]);
+    expect(sniffText(bytes)).toEqual({ kind: 'text', text: '嗯', encoding: 'utf-8' });
+  });
+
+  it('PNG 一眼判成二进制 —— 别让它被 GBK 解出「塒NG…」那种像字的垃圾', () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new Array(64).fill(0x41)]);
+    expect(sniffText(png)).toEqual({ kind: 'binary' });
+  });
+
+  it('ZIP / PDF 同样拦下(Office 与 APK 都是 ZIP 那一族)', () => {
+    expect(sniffText(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3]))).toEqual({ kind: 'binary' });
+    expect(sniffText(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]))).toEqual({ kind: 'binary' });
+  });
+
+  it('含 NUL 的字节判成二进制', () => {
+    expect(sniffText(new Uint8Array([0x41, 0x00, 0x42, 0x00]))).toEqual({ kind: 'binary' });
+  });
+
+  it('空文件算文本(空文本),不是二进制', () => {
+    expect(sniffText(new Uint8Array(0))).toEqual({ kind: 'text', text: '', encoding: 'utf-8' });
+  });
+});
+
+describe('正文怎么渲染', () => {
+  const cfg = (over: Partial<QQFilesConfig> = {}): QQFilesConfig => ({ ...FILES_DEFAULTS, ...over });
+  const rec = { id: 'FILE-3', name: '备注.txt', size: 12, url: null, ref: null };
+
+  it('小文本:全文直接进正文', () => {
+    const text = renderFileText(rec, { kind: 'text', text: '哈喽哈喽', encoding: 'utf-8' }, cfg());
+    expect(text).toContain('[文件 备注.txt · 12 B · FILE-3]');
+    expect(text).toContain('哈喽哈喽');
+    expect(text).not.toContain('qq2_read_file');
+  });
+
+  it('大文本:只给头几行,并告诉她怎么接着看', () => {
+    const big = Array.from({ length: 900 }, (_, i) => `第 ${i + 1} 行`).join('\n');
+    const text = renderFileText(rec, { kind: 'text', text: big, encoding: 'utf-8' }, cfg({ previewLines: 3 }));
+    expect(text).toContain('第 1 行');
+    expect(text).toContain('第 3 行');
+    expect(text).not.toContain('第 4 行');
+    expect(text).toContain('共 900 行');
+    expect(text).toContain('qq2_read_file FILE-3 offset=3');
+  });
+
+  it('二进制:只有一句说明,不承诺任何「打开」动作', () => {
+    const text = renderFileText({ ...rec, name: 'x.apk', size: 60 * 1024 * 1024 }, { kind: 'binary' }, cfg());
+    expect(text).toContain('x.apk');
+    expect(text).toContain('60.0 MB');
+    expect(text).toContain('不是文本');
+    expect(text).toContain('没有读内容');
+  });
+
+  it('非 UTF-8 的文本会标出编码(她据此知道那是编码问题、不是乱码)', () => {
+    const text = renderFileText(rec, { kind: 'text', text: '你好', encoding: 'gbk' }, cfg());
+    expect(text).toContain('gbk');
+  });
+});
+
+describe('大小怎么写给人看', () => {
+  it('三档', () => {
+    expect(formatBytes(12)).toBe('12 B');
+    expect(formatBytes(240 * 1024)).toBe('240 KB');
+    expect(formatBytes(60.7 * 1024 * 1024)).toBe('60.7 MB');
+  });
+});
+
+describe('语音转写的措辞(他定的那条:必须写明可能识别错)', () => {
+  it('拿到文字时带「转写 · 可能有错」', () => {
+    const got = renderTranscription({ text: '明天下午三点开会', language: 'zh' });
+    expect(got.ok).toBe(true);
+    expect(got.text).toContain('语音转写');
+    expect(got.text).toContain('可能有错');
+    expect(got.text).toContain('明天下午三点开会');
+  });
+
+  it('没转出文字时也照实说,不假装听到了', () => {
+    const got = renderTranscription({ text: '  ', language: 'zh' });
+    expect(got.ok).toBe(false);
+    expect(got.text).toContain('没转出文字');
+  });
+
+  it('情感不是中性才附上', () => {
+    expect(renderTranscription({ text: '好', emotion: 'HAPPY' }).text).toContain('HAPPY');
+    expect(renderTranscription({ text: '好', emotion: 'NEUTRAL' }).text).not.toContain('NEUTRAL');
+  });
+});
+
+// ————— 文件库(注入假 fetch,真落盘) —————
+
+let dir: string;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'qq-files-'));
+});
+
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+function fakeFetch(table: Record<string, Uint8Array>): typeof fetch {
+  return (async (url: string) => {
+    if (String(url).includes('boom')) throw new Error('连接被重置');
+    const body = table[String(url)];
+    if (!body) return new Response('nope', { status: 404 });
+    return new Response(body, { status: 200, headers: { 'content-length': String(body.byteLength) } });
+  }) as unknown as typeof fetch;
+}
+
+function makeLib(
+  table: Record<string, Uint8Array> = {},
+  over: Partial<QQFilesConfig> = {},
+  resolveUrl: (ref: unknown) => Promise<string | null> = async () => null,
+): FileLibrary {
+  return new FileLibrary({
+    dataDir: dir,
+    cfg: { ...FILES_DEFAULTS, ...over },
+    log: nullLogger(),
+    fetchImpl: fakeFetch(table),
+    resolveUrl,
+  });
+}
+
+const registry = (): string => join(dir, 'qq-files', 'registry.jsonl');
+
+describe('文件库', () => {
+  it('登记给 FILE-N,解析后落盘、正文带内容', async () => {
+    const lib = makeLib({ 'http://x/a.txt': utf8('哈喽哈喽') });
+    const id = lib.register({ name: 'a.txt', size: 12, url: 'http://x/a.txt' });
+    expect(id).toBe('FILE-1');
+    const got = await lib.resolve(id);
+    expect(got.ok).toBe(true);
+    expect(got.rendered).toContain('哈喽哈喽');
+    expect(readFileSync(registry(), 'utf8')).toContain('"kind":"text"');
+    expect(existsSync(join(dir, 'qq-files', lib.get(id)!.file!))).toBe(true);
+  });
+
+  it('段里没给地址时,去 resolveUrl 要(私聊 file 段就是这条路)', async () => {
+    const lib = makeLib({ 'http://x/b.txt': utf8('要来的内容') }, {}, async () => 'http://x/b.txt');
+    const id = lib.register({ name: 'b.txt', size: undefined, url: null, ref: { fileId: 'fid' } });
+    expect((await lib.resolve(id)).rendered).toContain('要来的内容');
+  });
+
+  it('要不到地址:如实说,不假装读到了', async () => {
+    const lib = makeLib();
+    const id = lib.register({ name: 'c.txt', size: 10, url: null });
+    const got = await lib.resolve(id);
+    expect(got.ok).toBe(false);
+    expect(got.rendered).toContain('没能从协议端拿到下载地址');
+  });
+
+  it('超过大小上限:不下、不读,并说清是超过上限(群里那个 60MB 就是这一档)', async () => {
+    const lib = makeLib({}, { maxBytes: 1024 });
+    const id = lib.register({ name: 'big.apk', size: 60 * 1024 * 1024, url: 'http://x/none' });
+    const got = await lib.resolve(id);
+    expect(got.ok).toBe(false);
+    expect(got.rendered).toContain('超过上限');
+    expect(got.rendered).toContain('没有下载');
+  });
+
+  it('下载失败:照实回,不编内容', async () => {
+    const lib = makeLib({ 'http://x/boom.txt': utf8('x') });
+    const id = lib.register({ name: 'd.txt', size: 1, url: 'http://x/boom.txt' });
+    const got = await lib.resolve(id);
+    expect(got.ok).toBe(false);
+    expect(got.rendered).toContain('下载失败');
+  });
+
+  it('按段读:行号从 1 数,一次给一段,并提示后面还有多少', async () => {
+    const body = Array.from({ length: 50 }, (_, i) => `L${i + 1}`).join('\n');
+    const lib = makeLib({ 'http://x/e.txt': utf8(body) }, { inlineMaxBytes: 16 });
+    const id = lib.register({ name: 'e.txt', size: 300, url: 'http://x/e.txt' });
+    await lib.resolve(id);
+    const first = lib.read(id, 1, 5);
+    expect(first.text).toContain('L1\nL2\nL3\nL4\nL5');
+    expect(first.text).toContain('共 50 行');
+    expect(first.text).toContain('offset=6');
+    const later = lib.read(id, 46, 10);
+    expect(later.text).toContain('L46');
+    expect(later.text).toContain('L50');
+    expect(later.text).not.toContain('offset=56');
+  });
+
+  it('读一个不认识/不是文本/超限的编号,各给一句人话', async () => {
+    const lib = makeLib({ 'http://x/f.png': new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]) });
+    expect(lib.read('FILE-99', 1, 10).failed).toBe(true);
+    const img = lib.register({ name: 'f.png', size: 7, url: 'http://x/f.png' });
+    await lib.resolve(img);
+    expect(lib.read(img, 1, 10).text).toContain('不是文本文件');
+    const big = lib.register({ name: 'g.apk', size: 99 * 1024 * 1024, url: 'http://x/none' });
+    await lib.resolve(big);
+    expect(lib.read(big, 1, 10).text).toContain('超过大小上限');
+  });
+
+  it('重启后编号接着走,旧记录还在(她还能提到上一次那个 FILE-N)', async () => {
+    const first = makeLib({ 'http://x/h.txt': utf8('第一份') });
+    const id = first.register({ name: 'h.txt', size: 9, url: 'http://x/h.txt' });
+    await first.resolve(id);
+
+    const again = makeLib();
+    expect(again.fileCount()).toBe(1);
+    expect(again.get('FILE-1')?.kind).toBe('text');
+    expect(again.register({ name: 'i.txt' })).toBe('FILE-2');
+  });
+});
+
+// ————— 真回路:MockNapCat ⇄ qq2 ⇄ 记录型 host —————
+
+const GROUP = 424242;
+const PEER = 200002;
+
+interface Recorded {
+  event: EventEnvelope;
+  opts: PushOptions | undefined;
+}
+
+class RecordingHost {
+  readonly pushed: Recorded[] = [];
+  readonly host: WorldHost;
+
+  constructor() {
+    const self = this;
+    this.host = {
+      pushEvent: async (event: Parameters<WorldHost['pushEvent']>[0], opts?: PushOptions): Promise<EventEnvelope> => {
+        const stored = { cursor: self.pushed.length + 1, origin: 'external', contextDelivery: 'immediate', ...event } as unknown as EventEnvelope;
+        self.pushed.push({ event: stored, opts });
+        return stored;
+      },
+      store: { range: () => [], grep: () => [] },
+      drainPendingEvents: async () => [],
+      modelFacts: { model: () => 'test', accepts: () => false, contextWindow: () => undefined },
+      blob: () => null,
+      reportUsage: () => {},
+      log: nullLogger(),
+    } as unknown as WorldHost;
+  }
+
+  texts(type = 'qq.message'): string[] {
+    return this.pushed.filter((p) => p.event.type === type).map((p) => p.event.text ?? '');
+  }
+
+  last(type = 'qq.message'): string {
+    const all = this.texts(type);
+    return all[all.length - 1] ?? '';
+  }
+}
+
+let mock: MockNapCat;
+let mod: QQ2World;
+let host: RecordingHost;
+let dataDir: string;
+let fileServer: { url: (name: string) => string; server: Server };
+
+/** 一个真 HTTP 服务:按文件名给字节(都是文本,便于断言内容)。 */
+async function serveFiles(table: Record<string, string>): Promise<{ url: (n: string) => string; server: Server }> {
+  const server = createServer((req, res) => {
+    const name = (req.url ?? '/').replace(/^\//, '').split('?')[0]!;
+    const body = table[name];
+    if (body === undefined) {
+      res.writeHead(404).end();
+      return;
+    }
+    const buf = Buffer.from(body, 'utf8');
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(buf.byteLength) });
+    res.end(buf);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  const port = typeof addr === 'object' && addr ? addr.port : 0;
+  return { url: (n: string) => `http://127.0.0.1:${port}/${n}`, server };
+}
+
+async function waitUntil(check: () => boolean, timeoutMs = 6000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error('等待超时');
+}
+
+/** 灌进去的那条语音的替身转写:走真渲染函数,于是措辞那一条也端到端验到了。 */
+const fakeAsr = {
+  async transcribe() {
+    return renderTranscription({ text: '明天下午三点开会', language: 'zh' });
+  },
+};
+
+beforeEach(async () => {
+  mock = new MockNapCat({ port: 0, groupId: GROUP, selfId: 5000, selfNickname: 'bot', selfCard: 'botcard', groupName: '深夜食堂' });
+  const port = await mock.start();
+  host = new RecordingHost();
+  dataDir = mkdtempSync(join(tmpdir(), 'qq2-inbound-'));
+  fileServer = await serveFiles({
+    'notes.txt': '哈喽哈喽',
+    // 500 行 × 约 40 字节 ≈ 20 KB,稳稳超过 8 KB 的内联线,于是走「前几行 + 编号」那条路
+    'big.log': Array.from({ length: 500 }, (_, i) => `第 ${i + 1} 行 ${'填充内容'.repeat(5)}`).join('\n'),
+    'voice.amr': 'AMR-BYTES-PLACEHOLDER',
+  });
+  mod = new QQ2World(
+    {
+      wsUrl: `ws://127.0.0.1:${port}`,
+      groups: [GROUP],
+      privates: [PEER],
+      token: '',
+      dataDir,
+      files: { ...FILES_DEFAULTS, waitMs: 5000 },
+      asr: { ...ASR_DEFAULTS },
+    },
+    { asr: fakeAsr },
+  );
+  await mod.start(host.host);
+  await mod.waitReady();
+});
+
+afterEach(async () => {
+  await mod.stop();
+  await mock.close();
+  await new Promise<void>((resolve) => fileServer.server.close(() => resolve()));
+  rmSync(dataDir, { recursive: true, force: true });
+});
+
+describe('文件消息真的走到推送点(真回路)', () => {
+  it('群文件段(段里带地址):正文里就是文件内容,不是 [file]', async () => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'file', data: { file: 'notes.txt', file_id: 'fid-1', file_size: '12', url: fileServer.url('notes.txt') } }],
+    });
+    await waitUntil(() => host.texts().length === 1);
+    const text = host.last();
+    expect(text).not.toContain('[file]');
+    expect(text).toContain('notes.txt');
+    expect(text).toContain('哈喽哈喽');
+  });
+
+  it('私聊文件段(段里没地址,要问协议端):同样拿到内容 —— 这正是实测里最要紧的一条', async () => {
+    mock.setMockFileUrl('fid-2', fileServer.url('notes.txt'));
+    mock.emitRaw({
+      post_type: 'message',
+      message_type: 'private',
+      sub_type: 'friend',
+      user_id: PEER,
+      message_id: 7001,
+      time: Math.floor(Date.now() / 1000),
+      sender: { user_id: PEER, nickname: '他' },
+      message: [{ type: 'file', data: { file: 'notes.txt', file_id: 'fid-2', file_size: '12' } }],
+      raw_message: '',
+    });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('哈喽哈喽');
+  });
+
+  it('协议端不认取址动作时:正文如实说「没能拿到下载地址」,不编内容', async () => {
+    mock.emitRaw({
+      post_type: 'message',
+      message_type: 'private',
+      sub_type: 'friend',
+      user_id: PEER,
+      message_id: 7002,
+      time: Math.floor(Date.now() / 1000),
+      sender: { user_id: PEER, nickname: '他' },
+      message: [{ type: 'file', data: { file: 'x.txt', file_id: 'nope', file_size: '3' } }],
+      raw_message: '',
+    });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('没能从协议端拿到下载地址');
+  });
+
+  it('大文件:正文只给头几行 + 编号;qq2_read_file 按段读得回来', async () => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'file', data: { file: 'big.log', file_id: 'fid-3', file_size: '3000', url: fileServer.url('big.log') } }],
+    });
+    await waitUntil(() => host.texts().length === 1);
+    const text = host.last();
+    expect(text).toContain('第 1 行');
+    expect(text).not.toContain('第 500 行');
+    expect(text).toContain('qq2_read_file FILE-1');
+
+    const tool = mod.tools().find((t) => t.name === 'qq2_read_file');
+    expect(tool).toBeTruthy();
+    const out = (await tool!.handler({ file_id: 'FILE-1', offset: 499, limit: 5 }, {} as never)) as { text?: string } | string;
+    const body = typeof out === 'string' ? out : (out.text ?? '');
+    expect(body).toContain('第 499 行');
+    expect(body).toContain('第 500 行');
+  });
+
+  it('语音段:正文是转写文字,而且写着「可能有错」', async () => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'record', data: { file: 'v.amr', url: fileServer.url('voice.amr'), file_size: '20' } }],
+    });
+    await waitUntil(() => host.texts().length === 1);
+    const text = host.last();
+    expect(text).not.toContain('[语音]');
+    expect(text).toContain('语音转写');
+    expect(text).toContain('可能有错');
+    expect(text).toContain('明天下午三点开会');
+  });
+
+  it('关掉文件开关:file 段退回框架的占位(不动既有行为)', async () => {
+    await mod.stop();
+    await mock.close();
+    const port = await mock.start();
+    mod = new QQ2World({ wsUrl: `ws://127.0.0.1:${port}`, groups: [GROUP], privates: [PEER], token: '', dataDir, files: { ...FILES_DEFAULTS, enabled: false } }, { asr: fakeAsr });
+    await mod.start(host.host);
+    await mod.waitReady();
+    host.pushed.length = 0;
+    mock.emitGroupMessage({ user_id: 111, segments: [{ type: 'file', data: { file: 'a.txt', file_id: 'f', url: fileServer.url('notes.txt') } }] });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('[file]');
+  });
+});
