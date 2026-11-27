@@ -33,7 +33,8 @@ import { DigestLedger, renderDigest } from './digest.ts';
 import { splitForSending } from './split.ts';
 import { ImageLibrary, type PrecheckResult } from './images.ts';
 import { IMAGE_KIND_IDS, LabelStore, kindLabel, normalizeKind } from './labels.ts';
-import { FileLibrary, formatBytes, type FileRecord } from './files.ts';
+import { FileLibrary, extOf, formatBytes, type FileRecord } from './files.ts';
+import { isGif } from './gif-preview.ts';
 import { InboundAsr, type AsrOutcome } from './asr.ts';
 import { SPLIT_DEFAULTS, VOICE_DEFAULTS, FILES_DEFAULTS, ASR_DEFAULTS, DIGEST_DEFAULTS, type QQImagesConfig, type QQSendSplitConfig, type QQVoiceConfig, type QQFilesConfig, type QQAsrConfig, type QQDigestConfig } from './config.ts';
 import { planVoiceBars, billableChars, type SayResult } from './voice.ts';
@@ -53,6 +54,7 @@ import {
 } from './onebot/conversation.ts';
 import { OneBotDriver, type OneBotEvent } from './onebot/driver.ts';
 import { HISTORY_TOOL_DECLS, createHistoryTools } from './onebot/history-tools.ts';
+import { MIME_EXT } from './onebot/image-download.ts';
 import {
   buildOutgoing,
   makeImagePolicy,
@@ -268,6 +270,23 @@ const READ_FILE_DECL: Omit<ToolDef, 'handler'> = {
   },
 };
 
+const GET_ATTACHMENT_DECL: Omit<ToolDef, 'handler'> = {
+  name: 'qq2_get_attachment',
+  description:
+    'Retrieve the original bytes of a QQ attachment by its IMG-N or FILE-N id. The receipt gives a filename '
+    + 'and a Cortico log: handle you can pass to another tool, such as devshop_start. For GIFs this returns '
+    + 'the original animation. Use qq2_get_image to see the preview, or qq2_read_file to read text.',
+  tags: ['read'],
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      attachment_id: { type: 'string', description: 'The full QQ attachment id, e.g. IMG-3 or FILE-8.' },
+    },
+    required: ['attachment_id'],
+  },
+};
+
 /** `qq2_get_image`(视觉或取图库任一在时才有) */
 const GET_IMAGE_DECL: Omit<ToolDef, 'handler'> = {
   name: 'qq2_get_image',
@@ -386,6 +405,7 @@ export const QQ2_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   IMAGE_TAG_DECL,
   IMAGE_LIST_DECL,
   READ_FILE_DECL,
+  GET_ATTACHMENT_DECL,
 ];
 
 /** `host.pushEvent` 的入参;包装器只改 opts,不动事件本身。 */
@@ -845,20 +865,22 @@ export class QQ2World implements World {
   ): string {
     if (meta.dup_of) {
       const dup = String(meta.dup_of);
-      const rec = this.labels?.getByImageId(dup);
-      const tag = rec && this.labels ? this.labels.formatRecord(rec) : '还没贴标签';
-      return `[${label} ${id}${gifMark}，与 ${dup} 是同一张图，已识别过;${tag};要看用 qq2_get_image("${id}")]`;
+      const name = this.visionDuplicateName(id);
+      return `[${label} ${id}${gifMark}，与 ${dup} 是同一张图，已识别过;${name};要看用 qq2_get_image("${id}")]`;
     }
     return `[${label} ${id}${gifMark} 识别失败]`;
   }
 
   /** 异步识图事件里的重复图:英文那句后面补上她自己的标签与取回入口。 */
   private visionDuplicateText(text: string, meta: Record<string, unknown>): string {
-    const dup = typeof meta.dup_of === 'string' ? meta.dup_of : '';
-    const rec = dup ? this.labels?.getByImageId(dup) : undefined;
-    const tag = rec && this.labels ? this.labels.formatRecord(rec) : '还没贴标签';
     const id = typeof meta.image_id === 'string' ? meta.image_id : '';
-    return `${text}\n(${tag};要看用 qq2_get_image("${id}"))`;
+    return `${text}\n(${this.visionDuplicateName(id)};要看用 qq2_get_image("${id}"))`;
+  }
+
+  private visionDuplicateName(id: string): string {
+    const tag = this.labels?.formatForMessage(this.vision?.imageHash(id));
+    const name = this.vision?.filename(id);
+    return tag ?? (name ? `文件名:${name}` : '还没贴标签');
   }
 
   /** 这个会话要不要自动把新图挂进上下文。私聊始终挂;群聊看每群开关,缺省挂。 */
@@ -1479,7 +1501,7 @@ export class QQ2World implements World {
           const data = seg.data ?? {};
           const url = extractImageUrl(data);
           const gif = looksLikeGif(data);
-          return { url, gif, id: vision.registerImage(url, { gif }) };
+          return { url, gif, id: vision.registerImage(url, { gif, name: extractImageName(data) }) };
         });
       const precheck =
         passive && items.length
@@ -1542,7 +1564,7 @@ export class QQ2World implements World {
           const data = seg.data ?? {};
           const url = extractImageUrl(data);
           const gif = looksLikeGif(data);
-          return { url, gif, id: images.register(url, { gif }) };
+          return { url, gif, id: images.register(url, { gif, name: extractImageName(data) }) };
         });
       // 有时限的取回:时限内做完就把结论内联进这条消息(字节同时作为附件挂上去),
       // 没做完先给占位符,结果作为单独的 qq.image 事件随后到(见下面的收尾块)。
@@ -1962,9 +1984,10 @@ export class QQ2World implements World {
     const url = extractImageUrl(data);
     if (!url) return seg;
     const gif = looksLikeGif(data);
+    const name = extractImageName(data);
     const id = this.images
-      ? this.images.register(url, { gif })
-      : this.vision?.registerImage(url, { gif });
+      ? this.images.register(url, { gif, name })
+      : this.vision?.registerImage(url, { gif, name });
     if (!id) return seg;
     sink.images.push({ id, gif });
     return { type: 'text', data: { text: `[图片 ${id}${gif ? '(GIF)' : ''}]` } };
@@ -2550,6 +2573,7 @@ export class QQ2World implements World {
     }
     // 读文件只有文件库在时才有意义(它也是「够不着盘上那个目录」的补丁)
     if (this.files) list.push(this.readFileTool());
+    if (this.files || this.images || this.vision) list.push(this.getAttachmentTool());
     return list;
   }
 
@@ -2877,6 +2901,30 @@ export class QQ2World implements World {
     };
   }
 
+  private getAttachmentTool(): ToolDef {
+    return {
+      ...GET_ATTACHMENT_DECL,
+      handler: async ({ attachment_id }) => {
+        const id = typeof attachment_id === 'string' ? attachment_id.trim().toUpperCase() : '';
+        if (!/^(IMG|FILE)-\d+$/.test(id)) {
+          return { text: '请提供完整的 QQ 附件编号，例如 IMG-3 或 FILE-8。', failed: true };
+        }
+        try {
+          const original = id.startsWith('FILE-')
+            ? await this.files?.readOriginal(id)
+            : await this.readOriginalImage(id);
+          if (!original) return { text: `取不到 ${id} 的原件。请检查编号或 QQ2 缓存。`, failed: true };
+          return {
+            text: `已取回 ${id} 的原件「${original.name}」（${formatBytes(original.bytes.byteLength)}）。可将下方 log: 句柄和文件名交给需要原件的工具。`,
+            blobs: [{ ...original, fallbackText: `QQ 原件 ${id}` }],
+          };
+        } catch (err) {
+          return { text: `取回 ${id} 失败：${err instanceof Error ? err.message : String(err)}`, failed: true };
+        }
+      },
+    };
+  }
+
   /** `qq2_image_tag`:把一张图的 hash 与她的名字/类别写进标签库。 */
   private imageTagTool(): ToolDef {
     return {
@@ -2988,6 +3036,18 @@ export class QQ2World implements World {
     return null;
   }
 
+  private async readOriginalImage(id: string): Promise<{ bytes: Uint8Array; mime: string; name: string } | null> {
+    const original = await this.readStoredImage(id);
+    if (!original) return null;
+    const mime = isGif(original.bytes) ? 'image/gif' : original.mime;
+    const name = this.images?.filename(id) ?? this.vision?.filename(id);
+    const ext = `.${MIME_EXT[mime] ?? 'img'}`;
+    const suffix = name ? extOf(name) : '';
+    if (name && (suffix === ext || (ext === '.jpg' && suffix === '.jpeg'))) return { bytes: original.bytes, mime, name };
+    const stem = name ? name.slice(0, name.length - suffix.length) : id;
+    return { bytes: original.bytes, mime, name: `${stem}${ext}` };
+  }
+
   /** 取图库那条路:先读盘上那份(离线可),盘上没有才现取一次 —— 地址多半已过期,失败也照实回。 */
   private async getImageViaLibrary(id: string, original: boolean): Promise<string | ToolOutcome> {
     const images = this.images;
@@ -3045,6 +3105,18 @@ function extractImageUrl(data: Record<string, unknown>): string {
   if (typeof data.url === 'string' && data.url) return data.url;
   if (typeof data.file === 'string' && data.file) return data.file;
   return '';
+}
+
+/** 使用 QQ 给出的文件名，跳过 URL、路径和协议端以哈希命名的占位值。 */
+function extractImageName(data: Record<string, unknown>): string | undefined {
+  for (const value of [data.name, data.filename, data.file]) {
+    if (typeof value !== 'string') continue;
+    const name = value.trim();
+    if (!name || name.length > 200 || /[<>:"/\\|?*\x00-\x1f\x7f]|\.$/.test(name)) continue;
+    if (/^(?:[a-f0-9]{32}|[a-f0-9]{64})(?:\.[a-z0-9]+)?$/i.test(name)) continue;
+    return name;
+  }
+  return undefined;
 }
 
 /** 渲染阶段的 GIF 提示仅依据 url/file 的 .gif 后缀。 */

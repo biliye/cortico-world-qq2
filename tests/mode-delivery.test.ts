@@ -404,6 +404,12 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     const original = await callTool('qq2_get_image', { image_id: 'IMG-2', original: true }) as Record<string, unknown>;
     expect(blobsOf(original)[0]?.mime).toBe('image/gif');
     expect(Buffer.from(blobsOf(original)[0]!.bytes!)).toEqual(animatedGif());
+
+    const tool = revivedWorld().tools().find((t) => t.name === 'qq2_get_attachment')!;
+    const attachment = await tool.handler({ attachment_id: 'IMG-2' }, {} as never);
+    expect(attachment).toMatchObject({
+      blobs: [{ name: 'IMG-2.gif', mime: 'image/gif', bytes: new Uint8Array(animatedGif()) }],
+    });
   });
 
   it('群里的一张图:取回、落盘、挂成附件,正文里有 IMG-N 与大小', async () => {
@@ -438,6 +444,27 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     expect(String(ev.text)).toContain('还没贴标签');
     expect(String(ev.text)).toContain('qq2_get_image');
     expect(blobsOf(ev)).toHaveLength(0);
+  });
+
+  it('没贴标签的重复图复用 QQ 文件名，按需取回时保留文件名', async () => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'image', data: { url: imageServer.url('a.png'), file: '海边合照.png' } }],
+    });
+    await waitUntil(() => host.messageCount() === 1);
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'image', data: { url: imageServer.url('a.png'), file: '77e8cb28ac1cb62a80d1834fdf895672.png' } }],
+    });
+    await waitUntil(() => host.messageCount() === 2);
+    const duplicate = lastMessage();
+    expect(String(duplicate.text)).toContain('与 IMG-1 是同一份文件');
+    expect(String(duplicate.text)).toContain('文件名:海边合照.png');
+    expect(blobsOf(duplicate)).toHaveLength(0);
+
+    const original = await callTool('qq2_get_attachment', { attachment_id: 'IMG-2' }) as Record<string, unknown>;
+    expect(blobsOf(original)[0]).toMatchObject({ name: '海边合照.png', mime: 'image/png' });
+    expect(blobsOf(original)[0]?.bytes).toEqual(blobsOf(host.pushed[0]!.event as unknown as Record<string, unknown>)[0]?.bytes);
   });
 
   it('贴过标签的重复图:正文带标签与类别,仍不带字节', async () => {

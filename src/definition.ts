@@ -185,6 +185,10 @@ export const QQ2: WorldDefinition<QQConfigSection> = {
         zh: '按行读一个从 QQ 收到的文本文件,一次一段(只给文字,不给字节)。',
         en: 'Reads a text file received over QQ one stretch of lines at a time (text only, never raw bytes).',
       },
+      qq2_get_attachment: {
+        zh: '按 IMG 或 FILE 编号取原件，回执提供文件名和可交给其他扩展的 log: 句柄。',
+        en: 'Retrieves an original QQ attachment by IMG or FILE id and returns a filename and a log: handle for other extensions.',
+      },
     }),
     events: [
       {
@@ -218,8 +222,8 @@ export const QQ2: WorldDefinition<QQConfigSection> = {
       {
         type: 'qq.file',
         description: {
-          zh: 'QQ 收到的文件:正文(小文件全给、大文件只给头几行),或取不回的原因。',
-          en: 'A file received over QQ — its text (whole for small files, first lines for large ones), or why it could not be fetched.',
+          zh: 'QQ 文件下载后的正文预览、重复提示或失败原因。',
+          en: 'A text preview, duplicate notice, or fetch failure for a QQ file.',
         },
       },
       {

@@ -1,18 +1,18 @@
 /**
  * QQ 文件的落盘与取用(**不含解析**):下载、按 sha256 命名、记一张登记表、判「文本还是二进制」。
  *
- * 与 `images.ts` 是同一个族的第二个库,形状照它来(登记表 + 计数器跨重启 + 限时预取),少了两样:
- * - **不做感知哈希** —— 文件只按 sha256 判「同一份」,不判相似;
- * - **不挂附件** —— 附件字节每轮重发(那是另一条账),文件只往正文里递**文字**。
+ * 同内容共用一份原件，每次来件保留自己的文件名和编号。
+ * 正文只交文字，原件通过 qq2_get_attachment 按需取回。
  *
  * 一条要紧的实底(2026-10-12 实测,详录 `state/design/cortico-world-qq2-入站文件与音频.md`):
  * **私聊 `file` 段里没有下载地址**(只有文件名 / `file_id` / 大小),群文件也未必有。
  * 地址要另调协议端(`get_private_file_url` / `get_group_file_url`)—— 而本文件**不认识协议**,
  * 所以「取地址」留成 `deps.resolveUrl` 由 World 注入。
  */
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { mimeOfHandle } from 'cortico/core/blobs.ts';
 import type { Logger } from 'cortico/core/types.ts';
 import type { QQFilesConfig } from './config.ts';
 
@@ -27,6 +27,7 @@ export interface FileRecord {
   /** 取址凭据(私聊 file_id / 群 file_id+busid)。**本文件不解释它**,由注入的 resolveUrl 认得 */
   ref: unknown;
   hash?: string;
+  dupOf?: string;
   /** 盘上的文件名(sha256 + 扩展名) */
   file?: string;
   kind?: 'text' | 'binary';
@@ -177,6 +178,7 @@ export function formatBytes(n: number): string {
  */
 export function renderFileText(rec: FileRecord, sniff: Sniff | null, cfg: QQFilesConfig): string {
   const size = rec.size !== undefined ? formatBytes(rec.size) : '大小未知';
+  if (rec.dupOf) return `[重复文件 ${rec.name} · ${size} · ${rec.id} · 同 ${rec.dupOf}]`;
   const head = `[文件 ${rec.name} · ${size} · ${rec.id}]`;
   if (!sniff) return head;
   if (sniff.kind === 'binary') return `${head} 不是文本(二进制),没有读内容。`;
@@ -206,6 +208,7 @@ export class FileLibrary {
   private readonly deps: FileLibraryDeps;
   private readonly log: Logger;
   private readonly records = new Map<string, FileRecord>();
+  private readonly firstByHash = new Map<string, FileRecord>();
   private readonly inFlight = new Map<string, Promise<FileOutcome>>();
   private counter = 0;
 
@@ -255,7 +258,9 @@ export class FileLibrary {
   resolve(id: string): Promise<FileOutcome> {
     const running = this.inFlight.get(id);
     if (running) return running;
-    const work = this.run(id).finally(() => this.inFlight.delete(id));
+    const work = this.run(id).finally(() => {
+      if (this.inFlight.get(id) === work) this.inFlight.delete(id);
+    });
     this.inFlight.set(id, work);
     return work;
   }
@@ -263,7 +268,7 @@ export class FileLibrary {
   private async run(id: string): Promise<FileOutcome> {
     const rec = this.records.get(id);
     if (!rec) return { ok: false, rendered: `[文件 ${id}] 没有这个编号。` };
-    if (rec.rendered !== undefined) return { ok: true, rendered: rec.rendered };
+    if (rec.rendered !== undefined) return { ok: !rec.error, rendered: rec.rendered };
 
     // 大小闸门放在最前面:段里报的大小够用就不必下 —— 群里那个实测 60.7 MB。
     if (rec.size !== undefined && rec.size > this.deps.cfg.maxBytes) {
@@ -308,9 +313,22 @@ export class FileLibrary {
       return { ok: false, rendered: rec.rendered };
     }
 
+    if (this.records.get(id) !== rec) return { ok: false, rendered: `[文件 ${id}] 缓存已清空。` };
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    const first = this.firstByHash.get(hash);
+    const file = first?.file ?? `${hash}${extOf(rec.name)}`;
+    try {
+      this.writeBytes(file, bytes);
+    } catch (err) {
+      rec.error = 'store-failed';
+      rec.rendered = `[文件 ${rec.name} · ${id}] 保存失败：${err instanceof Error ? err.message : String(err)}`;
+      this.persist(rec);
+      return { ok: false, rendered: rec.rendered };
+    }
+
     const sniff = sniffText(bytes);
-    rec.hash = createHash('sha256').update(bytes).digest('hex');
-    rec.file = `${rec.hash}${extOf(rec.name)}`;
+    rec.hash = hash;
+    rec.file = file;
     rec.size = rec.size ?? bytes.length;
     rec.kind = sniff.kind;
     if (sniff.kind === 'text') {
@@ -318,10 +336,28 @@ export class FileLibrary {
       rec.chars = sniff.text.length;
       rec.lines = sniff.text.split('\n').length;
     }
-    this.writeBytes(rec, bytes);
+    if (first) rec.dupOf = first.id;
+    else this.firstByHash.set(hash, rec);
     rec.rendered = renderFileText(rec, sniff, this.deps.cfg);
     this.persist(rec);
     return { ok: true, rendered: rec.rendered };
+  }
+
+  /** 读取指定来件的原件和原名，复用同编号正在进行的下载。 */
+  async readOriginal(id: string): Promise<{ bytes: Uint8Array; mime: string; name: string }> {
+    const rec = this.records.get(id);
+    const result = await this.resolve(id);
+    if (!result.ok) throw new Error(result.rendered);
+    if (this.records.get(id) !== rec || !rec?.file || !isCachedFilename(rec.file)) {
+      throw new Error(`找不到 ${id} 的原件。`);
+    }
+    const path = join(this.dir, rec.file);
+    if (!existsSync(path)) throw new Error(`${id} 的原件已不在 QQ2 缓存中。`);
+    const bytes = readFileSync(path);
+    const firstFile = rec.hash ? this.firstByHash.get(rec.hash)?.file : undefined;
+    const recognizedMime = mimeOfHandle(firstFile ?? rec.file);
+    const mime = recognizedMime === 'application/octet-stream' && rec.kind === 'text' ? 'text/plain' : recognizedMime;
+    return { bytes, mime, name: rec.name };
   }
 
   /**
@@ -377,6 +413,7 @@ export class FileLibrary {
   clear(): number {
     const n = this.records.size;
     this.records.clear();
+    this.firstByHash.clear();
     this.inFlight.clear();
     this.counter = 0;
     try {
@@ -397,12 +434,20 @@ export class FileLibrary {
     return bytes;
   }
 
-  private writeBytes(rec: FileRecord, bytes: Uint8Array): void {
-    const path = join(this.dir, rec.file!);
-    if (!existsSync(path)) writeFileSync(path, bytes);
+  private writeBytes(file: string, bytes: Uint8Array): void {
+    const path = join(this.dir, file);
+    if (existsSync(path)) return;
+    const pending = `${path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(pending, bytes);
+      renameSync(pending, path);
+    } finally {
+      rmSync(pending, { force: true });
+    }
   }
 
   private persist(rec: FileRecord): void {
+    if (this.records.get(rec.id) !== rec) return;
     // 登记表是**追加**的流水(与取图库同一取舍):同一条重写一次比原地改写安全得多,
     // 读的时候后写的覆盖先写的。
     try {
@@ -433,7 +478,16 @@ export class FileLibrary {
         // 坏行跳过:登记表是流水,不值得为一行坏数据让整个 World 起不来
       }
     }
+    for (const rec of this.records.values()) {
+      if (rec.hash && rec.file && isCachedFilename(rec.file) && !rec.dupOf && !this.firstByHash.has(rec.hash)) {
+        this.firstByHash.set(rec.hash, rec);
+      }
+    }
   }
+}
+
+function isCachedFilename(name: string): boolean {
+  return /^[0-9a-f]{64}(?:\.[a-z0-9]{1,8})?$/.test(name);
 }
 
 /** 扩展名(带点);没有就空串。只用于盘上文件的命名,不参与「是不是文本」的判断。 */

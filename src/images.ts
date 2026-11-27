@@ -22,6 +22,7 @@ export interface ImageRecord {
   /** IMG-N(本库自己的编号;历史消息里的引用靠它) */
   id: string;
   url: string;
+  name?: string;
   /** 图片所在 QQ 消息的平台 message_id(register 时未知,attachMessage 后填) */
   messageId?: string;
   /** 落盘文件名(相对 {dataDir}/qq-images/),按 sha256 命名 */
@@ -92,9 +93,13 @@ export class ImageLibrary {
   }
 
   /** 登记一张待取回的图,分配 IMG-N(消息落库后由 attachMessage 回填消息号) */
-  register(url: string, opts?: { gif?: boolean }): string {
+  register(url: string, opts?: { gif?: boolean; name?: string }): string {
     const id = `IMG-${++this.counter}`;
-    this.records.set(id, { id, url, ts: shortTime(this.deps.timezone), ...(opts?.gif ? { gif: true } : {}) });
+    this.records.set(id, {
+      id, url, ts: shortTime(this.deps.timezone),
+      ...(opts?.gif ? { gif: true } : {}),
+      ...(opts?.name ? { name: opts.name } : {}),
+    });
     return id;
   }
 
@@ -117,6 +122,11 @@ export class ImageLibrary {
 
   get(id: string): ImageRecord | undefined {
     return this.records.get(id);
+  }
+
+  filename(id: string): string | undefined {
+    const rec = this.records.get(id);
+    return rec?.name ?? (rec?.dupOf ? this.records.get(rec.dupOf)?.name : undefined);
   }
 
   /**
@@ -243,9 +253,10 @@ export class ImageLibrary {
     const head = `[图片 ${rec.id}${gifMark} ${size}`.trimEnd();
     if (rec.dupOf) {
       const tag = this.deps.labelFor?.(rec.hash) ?? null;
-      const named = tag ? `;${tag}` : ';还没贴标签';
+      const name = this.filename(rec.id);
+      const named = tag ?? (name ? `文件名:${name}` : '还没贴标签');
       const hint = includeFetchHint ? `;要看用 qq2_get_image("${rec.id}")` : '';
-      return `${head};与 ${rec.dupOf} 是同一份文件,取图库里已有${named}${hint}]`;
+      return `${head};与 ${rec.dupOf} 是同一份文件,取图库里已有;${named}${hint}]`;
     }
     return `${head}]`;
   }

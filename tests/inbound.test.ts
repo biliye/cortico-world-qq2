@@ -5,12 +5,13 @@
  * 编号真落盘、工具真读得回来」。上一轮的教训(见设计记录「按住说话」那节)是:
  * 要验一条路,就用那条路自己灌一次已知输入。
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { nullLogger } from 'cortico/core/util.ts';
+import { LogBlobStore } from 'cortico/core/blobs.ts';
 import type { EventEnvelope, PushOptions, WorldHost } from 'cortico/core/types.ts';
 import { ASR_DEFAULTS, FILES_DEFAULTS, type QQFilesConfig } from '../src/config.ts';
 import { FileLibrary, formatBytes, renderFileText, sniffText } from '../src/files.ts';
@@ -239,6 +240,26 @@ describe('文件库', () => {
     expect(again.get('FILE-1')?.kind).toBe('text');
     expect(again.register({ name: 'i.txt' })).toBe('FILE-2');
   });
+
+  it('重启后改名重发只给引用，且两个编号读回同一份原件', async () => {
+    const bytes = utf8('具体需求只预览一次');
+    const url = 'http://x/request';
+    const first = makeLib({ [url]: bytes });
+    const original = first.register({ name: 'request.txt', url });
+    expect((await first.resolve(original)).rendered).toContain('具体需求只预览一次');
+
+    const restarted = makeLib({ [url]: bytes });
+    const renamed = restarted.register({ name: '更新.json', url });
+    const got = await restarted.resolve(renamed);
+    expect(got.rendered).toContain(`更新.json · ${formatBytes(bytes.length)} · ${renamed} · 同 ${original}`);
+    expect(got.rendered).not.toContain('具体需求只预览一次');
+    expect(readdirSync(join(dir, 'qq-files')).filter((name) => name !== 'registry.jsonl')).toHaveLength(1);
+
+    const offline = makeLib();
+    expect(await offline.readOriginal(original)).toEqual({ bytes: Buffer.from(bytes), name: 'request.txt', mime: 'text/plain' });
+    expect(await offline.readOriginal(renamed)).toEqual({ bytes: Buffer.from(bytes), name: '更新.json', mime: 'text/plain' });
+    expect(offline.read(renamed, 1, 1).text).toContain('具体需求只预览一次');
+  });
 });
 
 // ————— 真回路:MockNapCat ⇄ qq2 ⇄ 记录型 host —————
@@ -330,6 +351,7 @@ beforeEach(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'qq2-inbound-'));
   fileServer = await serveFiles({
     'notes.txt': '哈喽哈喽',
+    'fixture.pdf': '%PDF-1.5\n原件内容',
     // 500 行 × 约 40 字节 ≈ 20 KB,稳稳超过 8 KB 的内联线,于是走「前几行 + 编号」那条路
     'big.log': Array.from({ length: 500 }, (_, i) => `第 ${i + 1} 行 ${'填充内容'.repeat(5)}`).join('\n'),
     'voice.amr': 'AMR-BYTES-PLACEHOLDER',
@@ -368,6 +390,39 @@ describe('文件消息真的走到推送点(真回路)', () => {
     expect(text).not.toContain('[file]');
     expect(text).toContain('notes.txt');
     expect(text).toContain('哈喽哈喽');
+  });
+
+  it('重复二进制文件只推文字，按两个编号导出都得到可复用的 Core 句柄', async () => {
+    const send = (file: string, fileId: string) => mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'file', data: { file, file_id: fileId, url: fileServer.url('fixture.pdf') } }],
+    });
+    send('需求草案.pdf', 'first');
+    await waitUntil(() => host.texts().length === 1);
+    send('需求终版.pdf', 'second');
+    await waitUntil(() => host.texts().length === 2);
+    expect(host.last()).toContain('重复文件 需求终版.pdf');
+    expect(host.last()).toContain('FILE-2 · 同 FILE-1');
+    expect(host.pushed.map(({ event }) => event.blobs)).toEqual([undefined, undefined]);
+
+    const tool = mod.tools().find((t) => t.name === 'qq2_get_attachment')!;
+    const coreMedia = new LogBlobStore(dataDir);
+    expect(coreMedia.stat().count).toBe(0);
+    const handles: string[] = [];
+    for (const [id, name] of [['FILE-1', '需求草案.pdf'], ['FILE-2', '需求终版.pdf']]) {
+      const out = await tool.handler({ attachment_id: id }, {} as never);
+      expect(out).toMatchObject({ text: expect.stringContaining(name), blobs: [{ name, mime: 'application/pdf' }] });
+      if (typeof out === 'string') throw new Error(out);
+      const blob = out.blobs?.[0];
+      if (!blob || !('bytes' in blob)) throw new Error(`缺少 ${id} 的原件`);
+      handles.push(coreMedia.put(blob.bytes, blob.mime));
+    }
+    expect(handles[0]).toMatch(/^log:.*\.pdf$/);
+    expect(handles[1]).toBe(handles[0]);
+    expect(coreMedia.stat().count).toBe(1);
+    expect(coreMedia.read(handles[1]!)?.bytes).toEqual(Buffer.from('%PDF-1.5\n原件内容'));
+    expect(await tool.handler({ attachment_id: 'FILE-99' }, {} as never)).toMatchObject({ failed: true });
+    expect(await tool.handler({ attachment_id: '1' }, {} as never)).toMatchObject({ failed: true });
   });
 
   it('私聊文件段(段里没地址,要问协议端):同样拿到内容 —— 这正是实测里最要紧的一条', async () => {
