@@ -20,6 +20,7 @@ import { cachedGifPreview, isGif } from '../gif-preview.ts';
 interface ImageRecord {
   id: string;
   url: string;
+  name?: string;
   /** 图片所在QQ消息的平台message_id(register时未知,attachMessage后填) */
   messageId?: string;
   /** 保存的字节文件名(相对 {dataDir}/vision/) */
@@ -154,10 +155,11 @@ export class VisionService {
    * 分配 IMG-N 并登记；消息游标稍后回填。
    * `opts.gif` 是基于 URL 后缀的初值，下载后以实际 MIME 类型为准。
    */
-  registerImage(url: string, opts?: { gif?: boolean }): string {
+  registerImage(url: string, opts?: { gif?: boolean; name?: string }): string {
     const id = `IMG-${++this.counter}`;
     const record: ImageRecord = { id, url, ts: shortTime(this.timezone) };
     if (opts?.gif) record.gif = true;
+    if (opts?.name) record.name = opts.name;
     this.states.set(id, { record, active: true, session: [], chain: Promise.resolve() });
     // 未落消息号前只在内存;attachMessage后才持久化(避免崩溃留孤儿行)
     return id;
@@ -187,6 +189,15 @@ export class VisionService {
   /** 是否认识这个图片ID(qq_view_image用) */
   hasImage(id: string): boolean {
     return this.states.has(id);
+  }
+
+  filename(id: string): string | undefined {
+    const rec = this.states.get(id)?.record;
+    return rec?.name ?? (rec?.dupOf ? this.states.get(rec.dupOf)?.record.name : undefined);
+  }
+
+  imageHash(id: string): string | undefined {
+    return this.states.get(id)?.record.hash;
   }
 
   /**
@@ -506,8 +517,7 @@ export class VisionService {
   }
 
   private async download(url: string): Promise<{ buffer: Uint8Array; mime: string }> {
-    const got = await downloadImageBytes(url, this.cfg, this.fetchImpl);
-    return isGif(got.buffer) ? { ...got, mime: 'image/gif' } : got;
+    return downloadImageBytes(url, this.cfg, this.fetchImpl);
   }
 
   private saveImage(id: string, buffer: Uint8Array, mime: string): string {

@@ -5,14 +5,17 @@
  * 经过包装、变成哪种投递」。上一轮的教训就在这——只数个数看不出错位,要验一条路,
  * 就用那条路自己灌一次已知输入(见设计记录「按住说话」那一节的根因)。
  */
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PNG } from 'pngjs';
+import { LogBlobStore, withBlobLines } from 'cortico/core/blobs.ts';
+import { Core } from 'cortico/core/core.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 import type { EventEnvelope, Logger, PushOptions, WorldHost } from 'cortico/core/types.ts';
+import { functionCall, functionResult } from 'cortico/protocol/open-responses/context.ts';
+import { responsesInput } from 'cortico/providers/transport/responses-input.ts';
 import { MockNapCat } from './helpers/mock-napcat.ts';
 import { animatedGif, GIF_COLORS, GIF_HEIGHT, GIF_WIDTH } from './helpers/gif.ts';
 import { QQ2World } from '../src/world.ts';
@@ -84,7 +87,31 @@ let dataDir: string;
 /** 假图床:给图片段一个真能下到的地址 */
 let imageServer: { url: (name: string) => string; close: () => Promise<void> };
 
-/** 起一个只发一张图的 HTTP 服务;其它路径 404。 */
+// 1×1, 24-bit BMP with one padded pixel row.
+const bmp = Buffer.from(
+  '424d3a0000000000000036000000' +
+  '28000000010000000100000001001800000000000400000000000000000000000000000000000000' +
+  '0000ff00',
+  'hex',
+);
+// 1×1, uncompressed 8-bit grayscale TIFF.
+const tiff = Buffer.from(
+  '49492a00080000000900' +
+  '000104000100000001000000' + // ImageWidth
+  '010104000100000001000000' + // ImageLength
+  '020103000100000008000000' + // BitsPerSample
+  '030103000100000001000000' + // Compression
+  '060103000100000001000000' + // PhotometricInterpretation
+  '11010400010000007a000000' + // StripOffsets
+  '150103000100000001000000' + // SamplesPerPixel
+  '160104000100000001000000' + // RowsPerStrip
+  '170104000100000001000000' + // StripByteCounts
+  '000000007f', // No next image, then one pixel.
+  'hex',
+);
+const mislabeledText = Buffer.from('这是普通文本');
+
+/** 本地 HTTP 服务，提供图片和误标文件样例。 */
 async function serveImage(png: Uint8Array): Promise<typeof imageServer> {
   const { createServer } = await import('node:http');
   const gif = animatedGif();
@@ -94,9 +121,23 @@ async function serveImage(png: Uint8Array): Promise<typeof imageServer> {
       res.end(gif);
       return;
     }
-    if (req.url?.startsWith('/a.png')) {
-      res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(png.byteLength) });
+    if (req.url === '/a.png' || req.url === '/generic-image') {
+      const mime = req.url === '/a.png' ? 'image/png' : 'application/octet-stream';
+      res.writeHead(200, { 'content-type': mime, 'content-length': String(png.byteLength) });
       res.end(Buffer.from(png));
+      return;
+    }
+    if (req.url === '/scan.bmp') {
+      res.writeHead(200, { 'content-type': 'image/bmp' }).end(bmp);
+      return;
+    }
+    if (req.url === '/scan.tiff' || req.url === '/generic-tiff') {
+      const mime = req.url === '/scan.tiff' ? 'image/tiff' : 'application/octet-stream';
+      res.writeHead(200, { 'content-type': mime }).end(tiff);
+      return;
+    }
+    if (req.url === '/wrong.png') {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' }).end(mislabeledText);
       return;
     }
     res.writeHead(404).end();
@@ -110,15 +151,10 @@ async function serveImage(png: Uint8Array): Promise<typeof imageServer> {
   };
 }
 
-/** 一张真 PNG(ffmpeg 造;没有 ffmpeg 就用一块假字节,sha256 那几条照样能验) */
 function pngBytes(): Uint8Array {
-  try {
-    return new Uint8Array(
-      execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=200x150', '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'], { stdio: ['pipe', 'pipe', 'ignore'] }),
-    );
-  } catch {
-    return new Uint8Array(2048).fill(7);
-  }
+  const png = new PNG({ width: 8, height: 8 });
+  png.data.fill(255);
+  return PNG.sync.write(png);
 }
 
 async function waitUntil(check: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -363,6 +399,28 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   return tool.handler(args, {} as Parameters<typeof tool.handler>[1]);
 }
 
+async function expectBinaryHandoff(world: QQ2World, id: string, filename: string, bytes: Uint8Array): Promise<void> {
+  const tool = world.tools().find((t) => t.name === 'qq2_get_attachment')!;
+  const args = { attachment_id: id };
+  const attachment = await tool.handler(args, {} as never);
+  if (typeof attachment === 'string') throw new Error(attachment);
+  const logBlobs = new LogBlobStore(dataDir);
+  const refs = Core.prototype.internBlobs.call({ logBlobs }, attachment.blobs)!;
+  expect(refs).toEqual([expect.objectContaining({ handle: expect.stringMatching(/^log:.*\.bin$/), name: filename })]);
+  const handle = refs[0]!.handle;
+  const text = withBlobLines(attachment.text, refs);
+  const context = [
+    functionCall('get_attachment', tool.name, JSON.stringify(args)),
+    functionResult('get_attachment', text, { blobs: refs }),
+  ];
+  const { input } = responsesInput({ model: 'test', input: [] }, { context }, {
+    media: { enabled: () => true, read: (ref) => logBlobs.read(ref)?.bytes ?? null },
+  });
+  expect(input.find((item) => item.type === 'function_call_output')?.output).toBe(text);
+  expect(text).toContain(`[blob ${handle} application/octet-stream ${filename}]`);
+  expect(logBlobs.read(handle)?.bytes).toEqual(Buffer.from(bytes));
+}
+
 describe('取图(真回路:真 HTTP 图床)', () => {
   it.each([4000, 0])('GIF 预览投递、保存原件与重复跳过（等待 %d ms）', async (waitMs) => {
     if (!waitMs) await reboot(undefined, undefined, waitMs);
@@ -404,6 +462,8 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     const original = await callTool('qq2_get_image', { image_id: 'IMG-2', original: true }) as Record<string, unknown>;
     expect(blobsOf(original)[0]?.mime).toBe('image/gif');
     expect(Buffer.from(blobsOf(original)[0]!.bytes!)).toEqual(animatedGif());
+
+    await expectBinaryHandoff(revivedWorld(), 'IMG-2', 'IMG-2.gif', animatedGif());
   });
 
   it('群里的一张图:取回、落盘、挂成附件,正文里有 IMG-N 与大小', async () => {
@@ -424,6 +484,41 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     expect(String(ev.text)).toContain('看这个');
   });
 
+  it.each(['photo.png', 'photo.jpg'])('通用下载 MIME 的 PNG 按实际格式交接，QQ 文件名为 %s', async (name) => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'image', data: { url: imageServer.url('generic-image'), file: name } }],
+    });
+    await waitUntil(() => host.messageCount() === 1);
+    expect(blobsOf(lastMessage())[0]?.mime).toBe('image/png');
+    await expectBinaryHandoff(mod, 'IMG-1', 'photo.png', pngBytes());
+  });
+
+  it.each([
+    { route: 'scan.tiff', originalName: 'scan.tiff', exportedName: 'scan.tiff' },
+    { route: 'generic-tiff', originalName: 'scan.tiff', exportedName: 'scan.tiff' },
+    { route: 'generic-tiff', originalName: undefined, exportedName: 'IMG-1.img' },
+  ])('签名未识别时交接文件名为 $exportedName（$route）', async ({ route, originalName, exportedName }) => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'image', data: { url: imageServer.url(route), file: originalName } }],
+    });
+    await waitUntil(() => host.messageCount() === 1);
+    await expectBinaryHandoff(mod, 'IMG-1', exportedName, tiff);
+  });
+
+  it.each([
+    { segment: 'image', id: 'IMG-1', name: 'scan.bmp', bytes: bmp },
+    { segment: 'file', id: 'FILE-1', name: 'wrong.png', bytes: mislabeledText },
+  ])('交接 $name 时模型只收到句柄文字', async ({ segment, id, name, bytes }) => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: segment, data: { url: imageServer.url(name), file: name } }],
+    });
+    await waitUntil(() => host.messageCount() === 1);
+    await expectBinaryHandoff(mod, id, name, bytes);
+  });
+
   it('同一张图再发一次:只给文字,不带字节;要看用 qq2_get_image', async () => {
     const segments = [
       { type: 'image', data: { url: imageServer.url('a.png') } },
@@ -438,6 +533,27 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     expect(String(ev.text)).toContain('还没贴标签');
     expect(String(ev.text)).toContain('qq2_get_image');
     expect(blobsOf(ev)).toHaveLength(0);
+  });
+
+  it('没贴标签的重复图复用 QQ 文件名，按需取回时保留文件名', async () => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'image', data: { url: imageServer.url('a.png'), file: '海边合照.png' } }],
+    });
+    await waitUntil(() => host.messageCount() === 1);
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'image', data: { url: imageServer.url('a.png'), file: '77e8cb28ac1cb62a80d1834fdf895672.png' } }],
+    });
+    await waitUntil(() => host.messageCount() === 2);
+    const duplicate = lastMessage();
+    expect(String(duplicate.text)).toContain('与 IMG-1 是同一份文件');
+    expect(String(duplicate.text)).toContain('文件名:海边合照.png');
+    expect(blobsOf(duplicate)).toHaveLength(0);
+
+    const original = await callTool('qq2_get_attachment', { attachment_id: 'IMG-2' }) as Record<string, unknown>;
+    expect(blobsOf(original)[0]).toMatchObject({ name: '海边合照.png', mime: 'application/octet-stream' });
+    expect(blobsOf(original)[0]?.bytes).toEqual(blobsOf(host.pushed[0]!.event as unknown as Record<string, unknown>)[0]?.bytes);
   });
 
   it('贴过标签的重复图:正文带标签与类别,仍不带字节', async () => {
