@@ -517,8 +517,7 @@ export class VisionService {
   }
 
   private async download(url: string): Promise<{ buffer: Uint8Array; mime: string }> {
-    const got = await downloadImageBytes(url, this.cfg, this.fetchImpl);
-    return isGif(got.buffer) ? { ...got, mime: 'image/gif' } : got;
+    return downloadImageBytes(url, this.cfg, this.fetchImpl);
   }
 
   private saveImage(id: string, buffer: Uint8Array, mime: string): string {

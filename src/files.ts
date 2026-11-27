@@ -209,7 +209,7 @@ export class FileLibrary {
   private readonly log: Logger;
   private readonly records = new Map<string, FileRecord>();
   private readonly firstByHash = new Map<string, FileRecord>();
-  private readonly inFlight = new Map<string, Promise<FileOutcome>>();
+  private readonly inFlight = new Map<string, { result: Promise<FileOutcome>; retryFailed: boolean }>();
   private counter = 0;
 
   constructor(deps: FileLibraryDeps) {
@@ -254,21 +254,27 @@ export class FileLibrary {
     return got.ok ? got.rendered : got.rendered; // 失败也把说明内联(她知道发生了什么)
   }
 
-  /** 下载 + 落盘 + 嗅探 + 渲染。同一个编号并发调用只会真跑一次。 */
-  resolve(id: string): Promise<FileOutcome> {
+  /** 同编号共享在途下载。显式取原件可在预取失败后重试。 */
+  resolve(id: string, retryFailed = false): Promise<FileOutcome> {
     const running = this.inFlight.get(id);
-    if (running) return running;
-    const work = this.run(id).finally(() => {
-      if (this.inFlight.get(id) === work) this.inFlight.delete(id);
+    if (running) {
+      if (!retryFailed || running.retryFailed) return running.result;
+      const rec = this.records.get(id);
+      return running.result.then((outcome) =>
+        outcome.ok || this.records.get(id) !== rec ? outcome : this.resolve(id, true));
+    }
+    const result = this.run(id, retryFailed).finally(() => {
+      if (this.inFlight.get(id)?.result === result) this.inFlight.delete(id);
     });
-    this.inFlight.set(id, work);
-    return work;
+    this.inFlight.set(id, { result, retryFailed });
+    return result;
   }
 
-  private async run(id: string): Promise<FileOutcome> {
+  private async run(id: string, retryFailed: boolean): Promise<FileOutcome> {
     const rec = this.records.get(id);
     if (!rec) return { ok: false, rendered: `[文件 ${id}] 没有这个编号。` };
-    if (rec.rendered !== undefined) return { ok: !rec.error, rendered: rec.rendered };
+    const retry = retryFailed && (rec.error === 'no-url' || rec.error === 'download-failed');
+    if (rec.rendered !== undefined && !retry) return { ok: !rec.error, rendered: rec.rendered };
 
     // 大小闸门放在最前面:段里报的大小够用就不必下 —— 群里那个实测 60.7 MB。
     if (rec.size !== undefined && rec.size > this.deps.cfg.maxBytes) {
@@ -279,11 +285,10 @@ export class FileLibrary {
     }
 
     let url = rec.url;
-    if (!url) {
+    if (!url || retry) {
       try {
-        url = await this.deps.resolveUrl(rec.ref);
+        url = (await this.deps.resolveUrl(rec.ref)) ?? url;
       } catch (err) {
-        url = null;
         this.log.warn('取文件地址失败', { id, err: String(err) });
       }
     }
@@ -338,6 +343,7 @@ export class FileLibrary {
     }
     if (first) rec.dupOf = first.id;
     else this.firstByHash.set(hash, rec);
+    delete rec.error;
     rec.rendered = renderFileText(rec, sniff, this.deps.cfg);
     this.persist(rec);
     return { ok: true, rendered: rec.rendered };
@@ -346,7 +352,7 @@ export class FileLibrary {
   /** 读取指定来件的原件和原名，复用同编号正在进行的下载。 */
   async readOriginal(id: string): Promise<{ bytes: Uint8Array; mime: string; name: string }> {
     const rec = this.records.get(id);
-    const result = await this.resolve(id);
+    const result = await this.resolve(id, true);
     if (!result.ok) throw new Error(result.rendered);
     if (this.records.get(id) !== rec || !rec?.file || !isCachedFilename(rec.file)) {
       throw new Error(`找不到 ${id} 的原件。`);
@@ -429,9 +435,7 @@ export class FileLibrary {
     const doFetch = this.deps.fetchImpl ?? fetch;
     const res = await doFetch(url, { signal: AbortSignal.timeout(this.deps.cfg.fetchTimeoutMs) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    if (bytes.length > this.deps.cfg.maxBytes) throw new Error(`超过上限 ${formatBytes(this.deps.cfg.maxBytes)}`);
-    return bytes;
+    return new Uint8Array(await res.arrayBuffer());
   }
 
   private writeBytes(file: string, bytes: Uint8Array): void {
@@ -471,7 +475,7 @@ export class FileLibrary {
       try {
         const rec = JSON.parse(t) as FileRecord;
         if (!rec?.id) continue;
-        this.records.set(rec.id, { ...(this.records.get(rec.id) ?? {}), ...rec } as FileRecord);
+        this.records.set(rec.id, rec);
         const n = Number(rec.id.replace(/^FILE-/, ''));
         if (Number.isFinite(n) && n > this.counter) this.counter = n;
       } catch {

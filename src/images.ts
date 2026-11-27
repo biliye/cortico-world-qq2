@@ -17,6 +17,7 @@ import { extname, join } from 'node:path';
 import type { Logger } from 'cortico/core/types.ts';
 import { nullLogger, shortTime } from 'cortico/core/util.ts';
 import { cachedGifPreview, isGif } from './gif-preview.ts';
+import { MIME_EXT, pickImageMime } from './onebot/image-download.ts';
 
 export interface ImageRecord {
   /** IMG-N(本库自己的编号;历史消息里的引用靠它) */
@@ -64,14 +65,6 @@ export interface ImageLibraryDeps {
   log?: Logger;
   fetchImpl?: typeof fetch;
 }
-
-const MIME_EXT: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-  'image/bmp': 'bmp',
-};
 
 export class ImageLibrary {
   private readonly dir: string;
@@ -165,7 +158,7 @@ export class ImageLibrary {
       if (got.bytes.byteLength > this.deps.cfg.maxImageBytes) {
         return this.fail(rec, `超过大小上限(${got.bytes.byteLength} > ${this.deps.cfg.maxImageBytes} 字节)`, '不下载');
       }
-      const mime = isGif(got.bytes) ? 'image/gif' : got.mime.startsWith('image/') ? got.mime : 'image/jpeg';
+      const mime = pickImageMime(got.bytes, got.mime, rec.name ?? rec.url);
       rec.mime = mime;
       rec.size = got.bytes.byteLength;
       rec.gif = rec.gif || mime === 'image/gif';

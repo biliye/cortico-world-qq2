@@ -5,14 +5,17 @@
  * 经过包装、变成哪种投递」。上一轮的教训就在这——只数个数看不出错位,要验一条路,
  * 就用那条路自己灌一次已知输入(见设计记录「按住说话」那一节的根因)。
  */
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PNG } from 'pngjs';
+import { LogBlobStore, withBlobLines } from 'cortico/core/blobs.ts';
+import { Core } from 'cortico/core/core.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 import type { EventEnvelope, Logger, PushOptions, WorldHost } from 'cortico/core/types.ts';
+import { functionCall, functionResult } from 'cortico/protocol/open-responses/context.ts';
+import { responsesInput } from 'cortico/providers/transport/responses-input.ts';
 import { MockNapCat } from './helpers/mock-napcat.ts';
 import { animatedGif, GIF_COLORS, GIF_HEIGHT, GIF_WIDTH } from './helpers/gif.ts';
 import { QQ2World } from '../src/world.ts';
@@ -94,8 +97,9 @@ async function serveImage(png: Uint8Array): Promise<typeof imageServer> {
       res.end(gif);
       return;
     }
-    if (req.url?.startsWith('/a.png')) {
-      res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(png.byteLength) });
+    if (req.url === '/a.png' || req.url === '/generic-image') {
+      const mime = req.url === '/a.png' ? 'image/png' : 'application/octet-stream';
+      res.writeHead(200, { 'content-type': mime, 'content-length': String(png.byteLength) });
       res.end(Buffer.from(png));
       return;
     }
@@ -110,15 +114,10 @@ async function serveImage(png: Uint8Array): Promise<typeof imageServer> {
   };
 }
 
-/** 一张真 PNG(ffmpeg 造;没有 ffmpeg 就用一块假字节,sha256 那几条照样能验) */
 function pngBytes(): Uint8Array {
-  try {
-    return new Uint8Array(
-      execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=200x150', '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'], { stdio: ['pipe', 'pipe', 'ignore'] }),
-    );
-  } catch {
-    return new Uint8Array(2048).fill(7);
-  }
+  const png = new PNG({ width: 8, height: 8 });
+  png.data.fill(255);
+  return PNG.sync.write(png);
 }
 
 async function waitUntil(check: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -408,8 +407,24 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     const tool = revivedWorld().tools().find((t) => t.name === 'qq2_get_attachment')!;
     const attachment = await tool.handler({ attachment_id: 'IMG-2' }, {} as never);
     expect(attachment).toMatchObject({
-      blobs: [{ name: 'IMG-2.gif', mime: 'image/gif', bytes: new Uint8Array(animatedGif()) }],
+      blobs: [{ name: 'IMG-2.gif', mime: 'application/octet-stream', bytes: new Uint8Array(animatedGif()) }],
     });
+    if (typeof attachment === 'string') throw new Error(attachment);
+    const logBlobs = new LogBlobStore(dataDir);
+    const refs = Core.prototype.internBlobs.call({ logBlobs }, attachment.blobs)!;
+    const handle = refs[0]!.handle;
+    const text = withBlobLines(attachment.text, refs);
+    const context = [
+      functionCall('get_gif', tool.name, '{"attachment_id":"IMG-2"}'),
+      functionResult('get_gif', text, { blobs: refs }),
+    ];
+    const { input } = responsesInput({ model: 'test', input: [] }, { context }, {
+      media: { enabled: () => true, read: (ref) => logBlobs.read(ref)?.bytes ?? null },
+    });
+    const result = input.find((item) => item.type === 'function_call_output');
+    expect(result?.output).toBe(text);
+    expect(text).toContain(`[blob ${handle} application/octet-stream IMG-2.gif]`);
+    expect(logBlobs.read(handle)?.bytes).toEqual(animatedGif());
   });
 
   it('群里的一张图:取回、落盘、挂成附件,正文里有 IMG-N 与大小', async () => {
@@ -428,6 +443,18 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     expect(blobs[0]?.bytes?.byteLength).toBeGreaterThan(0);
     expect(String(ev.text)).toContain('[图片 IMG-1');
     expect(String(ev.text)).toContain('看这个');
+  });
+
+  it('通用下载 MIME 的 PNG 保留实际格式和原文件名', async () => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'image', data: { url: imageServer.url('generic-image'), file: 'photo.png' } }],
+    });
+    await waitUntil(() => host.messageCount() === 1);
+    expect(blobsOf(lastMessage())[0]?.mime).toBe('image/png');
+    const original = await callTool('qq2_get_attachment', { attachment_id: 'IMG-1' }) as Record<string, unknown>;
+    expect(blobsOf(original)[0]).toMatchObject({ name: 'photo.png', mime: 'image/png' });
+    expect(Buffer.from(blobsOf(original)[0]!.bytes!)).toEqual(Buffer.from(pngBytes()));
   });
 
   it('同一张图再发一次:只给文字,不带字节;要看用 qq2_get_image', async () => {

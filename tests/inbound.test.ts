@@ -260,6 +260,53 @@ describe('文件库', () => {
     expect(await offline.readOriginal(renamed)).toEqual({ bytes: Buffer.from(bytes), name: '更新.json', mime: 'text/plain' });
     expect(offline.read(renamed, 1, 1).text).toContain('具体需求只预览一次');
   });
+
+  it('预取返回 503 后，并发取原件共用一次刷新与下载，重启后仍可读取', async () => {
+    const expired = 'http://x/expired';
+    const fresh = 'http://x/fresh';
+    const attempts: string[] = [];
+    const bytes = utf8('重试取回的文件');
+    let finishPrefetch!: (response: Response) => void;
+    const prefetchResponse = new Promise<Response>((resolve) => { finishPrefetch = resolve; });
+    const lib = new FileLibrary({
+      dataDir: dir, cfg: FILES_DEFAULTS, log: nullLogger(),
+      resolveUrl: async () => fresh,
+      fetchImpl: async (url) => {
+        attempts.push(String(url));
+        return url === expired ? prefetchResponse : new Response(bytes);
+      },
+    });
+    const id = lib.register({ name: '需求.txt', url: expired });
+    const prefetch = lib.resolve(id);
+    const reading = Promise.all([lib.readOriginal(id), lib.readOriginal(id)]);
+    finishPrefetch(new Response(null, { status: 503 }));
+
+    expect(await prefetch).toMatchObject({ ok: false, rendered: expect.stringContaining('HTTP 503') });
+    expect((await reading).map(({ bytes }) => bytes)).toEqual([Buffer.from(bytes), Buffer.from(bytes)]);
+    expect(attempts).toEqual([expired, fresh]);
+    expect((await makeLib().readOriginal(id)).bytes).toEqual(Buffer.from(bytes));
+  });
+
+  it('第一次取址失败后可按原编号恢复，实际超限的文件保持拒绝', async () => {
+    const url = 'http://x/file';
+    const bytes = utf8('12345');
+    let lookups = 0;
+    const restored = makeLib({ [url]: bytes }, {}, async () => ++lookups === 1 ? null : url);
+    const id = restored.register({ name: '恢复.txt' });
+    expect((await restored.resolve(id)).ok).toBe(false);
+    expect((await restored.readOriginal(id)).bytes).toEqual(Buffer.from(bytes));
+    expect(lookups).toBe(2);
+
+    const limited = makeLib({ [url]: bytes }, { maxBytes: 4 }, async () => {
+      lookups++;
+      return url;
+    });
+    const tooBig = limited.register({ name: '超限.txt', url });
+    expect(await limited.resolve(tooBig)).toMatchObject({ ok: false, rendered: expect.stringContaining('超过上限') });
+    expect(limited.get(tooBig)?.error).toBe('too-large');
+    await expect(limited.readOriginal(tooBig)).rejects.toThrow('超过上限');
+    expect(lookups).toBe(2);
+  });
 });
 
 // ————— 真回路:MockNapCat ⇄ qq2 ⇄ 记录型 host —————

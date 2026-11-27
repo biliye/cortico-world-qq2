@@ -54,7 +54,7 @@ import {
 } from './onebot/conversation.ts';
 import { OneBotDriver, type OneBotEvent } from './onebot/driver.ts';
 import { HISTORY_TOOL_DECLS, createHistoryTools } from './onebot/history-tools.ts';
-import { MIME_EXT } from './onebot/image-download.ts';
+import { MIME_EXT, pickImageMime } from './onebot/image-download.ts';
 import {
   buildOutgoing,
   makeImagePolicy,
@@ -2914,9 +2914,11 @@ export class QQ2World implements World {
             ? await this.files?.readOriginal(id)
             : await this.readOriginalImage(id);
           if (!original) return { text: `取不到 ${id} 的原件。请检查编号或 QQ2 缓存。`, failed: true };
+          // Core 会把 image/* 附件送给视觉模型。GIF 原件用二进制句柄交接，保留文件名。
+          const mime = original.mime === 'image/gif' || isGif(original.bytes) ? 'application/octet-stream' : original.mime;
           return {
             text: `已取回 ${id} 的原件「${original.name}」（${formatBytes(original.bytes.byteLength)}）。可将下方 log: 句柄和文件名交给需要原件的工具。`,
-            blobs: [{ ...original, fallbackText: `QQ 原件 ${id}` }],
+            blobs: [{ ...original, mime, fallbackText: `QQ 原件 ${id}` }],
           };
         } catch (err) {
           return { text: `取回 ${id} 失败：${err instanceof Error ? err.message : String(err)}`, failed: true };
@@ -3039,8 +3041,8 @@ export class QQ2World implements World {
   private async readOriginalImage(id: string): Promise<{ bytes: Uint8Array; mime: string; name: string } | null> {
     const original = await this.readStoredImage(id);
     if (!original) return null;
-    const mime = isGif(original.bytes) ? 'image/gif' : original.mime;
     const name = this.images?.filename(id) ?? this.vision?.filename(id);
+    const mime = pickImageMime(original.bytes, original.mime, name ?? id);
     const ext = `.${MIME_EXT[mime] ?? 'img'}`;
     const suffix = name ? extOf(name) : '';
     if (name && (suffix === ext || (ext === '.jpg' && suffix === '.jpeg'))) return { bytes: original.bytes, mime, name };
