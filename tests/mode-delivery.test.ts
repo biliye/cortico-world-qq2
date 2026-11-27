@@ -87,7 +87,16 @@ let dataDir: string;
 /** 假图床:给图片段一个真能下到的地址 */
 let imageServer: { url: (name: string) => string; close: () => Promise<void> };
 
-/** 起一个只发一张图的 HTTP 服务;其它路径 404。 */
+// 1×1, 24-bit BMP with one padded pixel row.
+const bmp = Buffer.from(
+  '424d3a0000000000000036000000' +
+  '28000000010000000100000001001800000000000400000000000000000000000000000000000000' +
+  '0000ff00',
+  'hex',
+);
+const mislabeledText = Buffer.from('这是普通文本');
+
+/** 本地 HTTP 服务，提供图片和误标文件样例。 */
 async function serveImage(png: Uint8Array): Promise<typeof imageServer> {
   const { createServer } = await import('node:http');
   const gif = animatedGif();
@@ -101,6 +110,14 @@ async function serveImage(png: Uint8Array): Promise<typeof imageServer> {
       const mime = req.url === '/a.png' ? 'image/png' : 'application/octet-stream';
       res.writeHead(200, { 'content-type': mime, 'content-length': String(png.byteLength) });
       res.end(Buffer.from(png));
+      return;
+    }
+    if (req.url === '/scan.bmp') {
+      res.writeHead(200, { 'content-type': 'image/bmp' }).end(bmp);
+      return;
+    }
+    if (req.url === '/wrong.png') {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' }).end(mislabeledText);
       return;
     }
     res.writeHead(404).end();
@@ -362,6 +379,28 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   return tool.handler(args, {} as Parameters<typeof tool.handler>[1]);
 }
 
+async function expectBinaryHandoff(world: QQ2World, id: string, filename: string, bytes: Uint8Array): Promise<void> {
+  const tool = world.tools().find((t) => t.name === 'qq2_get_attachment')!;
+  const args = { attachment_id: id };
+  const attachment = await tool.handler(args, {} as never);
+  if (typeof attachment === 'string') throw new Error(attachment);
+  const logBlobs = new LogBlobStore(dataDir);
+  const refs = Core.prototype.internBlobs.call({ logBlobs }, attachment.blobs)!;
+  expect(refs).toEqual([expect.objectContaining({ handle: expect.stringMatching(/^log:.*\.bin$/), name: filename })]);
+  const handle = refs[0]!.handle;
+  const text = withBlobLines(attachment.text, refs);
+  const context = [
+    functionCall('get_attachment', tool.name, JSON.stringify(args)),
+    functionResult('get_attachment', text, { blobs: refs }),
+  ];
+  const { input } = responsesInput({ model: 'test', input: [] }, { context }, {
+    media: { enabled: () => true, read: (ref) => logBlobs.read(ref)?.bytes ?? null },
+  });
+  expect(input.find((item) => item.type === 'function_call_output')?.output).toBe(text);
+  expect(text).toContain(`[blob ${handle} application/octet-stream ${filename}]`);
+  expect(logBlobs.read(handle)?.bytes).toEqual(Buffer.from(bytes));
+}
+
 describe('取图(真回路:真 HTTP 图床)', () => {
   it.each([4000, 0])('GIF 预览投递、保存原件与重复跳过（等待 %d ms）', async (waitMs) => {
     if (!waitMs) await reboot(undefined, undefined, waitMs);
@@ -404,27 +443,7 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     expect(blobsOf(original)[0]?.mime).toBe('image/gif');
     expect(Buffer.from(blobsOf(original)[0]!.bytes!)).toEqual(animatedGif());
 
-    const tool = revivedWorld().tools().find((t) => t.name === 'qq2_get_attachment')!;
-    const attachment = await tool.handler({ attachment_id: 'IMG-2' }, {} as never);
-    expect(attachment).toMatchObject({
-      blobs: [{ name: 'IMG-2.gif', mime: 'application/octet-stream', bytes: new Uint8Array(animatedGif()) }],
-    });
-    if (typeof attachment === 'string') throw new Error(attachment);
-    const logBlobs = new LogBlobStore(dataDir);
-    const refs = Core.prototype.internBlobs.call({ logBlobs }, attachment.blobs)!;
-    const handle = refs[0]!.handle;
-    const text = withBlobLines(attachment.text, refs);
-    const context = [
-      functionCall('get_gif', tool.name, '{"attachment_id":"IMG-2"}'),
-      functionResult('get_gif', text, { blobs: refs }),
-    ];
-    const { input } = responsesInput({ model: 'test', input: [] }, { context }, {
-      media: { enabled: () => true, read: (ref) => logBlobs.read(ref)?.bytes ?? null },
-    });
-    const result = input.find((item) => item.type === 'function_call_output');
-    expect(result?.output).toBe(text);
-    expect(text).toContain(`[blob ${handle} application/octet-stream IMG-2.gif]`);
-    expect(logBlobs.read(handle)?.bytes).toEqual(animatedGif());
+    await expectBinaryHandoff(revivedWorld(), 'IMG-2', 'IMG-2.gif', animatedGif());
   });
 
   it('群里的一张图:取回、落盘、挂成附件,正文里有 IMG-N 与大小', async () => {
@@ -452,9 +471,19 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     });
     await waitUntil(() => host.messageCount() === 1);
     expect(blobsOf(lastMessage())[0]?.mime).toBe('image/png');
-    const original = await callTool('qq2_get_attachment', { attachment_id: 'IMG-1' }) as Record<string, unknown>;
-    expect(blobsOf(original)[0]).toMatchObject({ name: 'photo.png', mime: 'image/png' });
-    expect(Buffer.from(blobsOf(original)[0]!.bytes!)).toEqual(Buffer.from(pngBytes()));
+    await expectBinaryHandoff(mod, 'IMG-1', 'photo.png', pngBytes());
+  });
+
+  it.each([
+    { segment: 'image', id: 'IMG-1', name: 'scan.bmp', bytes: bmp },
+    { segment: 'file', id: 'FILE-1', name: 'wrong.png', bytes: mislabeledText },
+  ])('交接 $name 时模型只收到句柄文字', async ({ segment, id, name, bytes }) => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: segment, data: { url: imageServer.url(name), file: name } }],
+    });
+    await waitUntil(() => host.messageCount() === 1);
+    await expectBinaryHandoff(mod, id, name, bytes);
   });
 
   it('同一张图再发一次:只给文字,不带字节;要看用 qq2_get_image', async () => {
@@ -490,7 +519,7 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     expect(blobsOf(duplicate)).toHaveLength(0);
 
     const original = await callTool('qq2_get_attachment', { attachment_id: 'IMG-2' }) as Record<string, unknown>;
-    expect(blobsOf(original)[0]).toMatchObject({ name: '海边合照.png', mime: 'image/png' });
+    expect(blobsOf(original)[0]).toMatchObject({ name: '海边合照.png', mime: 'application/octet-stream' });
     expect(blobsOf(original)[0]?.bytes).toEqual(blobsOf(host.pushed[0]!.event as unknown as Record<string, unknown>)[0]?.bytes);
   });
 

@@ -274,8 +274,8 @@ const GET_ATTACHMENT_DECL: Omit<ToolDef, 'handler'> = {
   name: 'qq2_get_attachment',
   description:
     'Retrieve the original bytes of a QQ attachment by its IMG-N or FILE-N id. The receipt gives a filename '
-    + 'and a Cortico log: handle you can pass to another tool, such as devshop_start. For GIFs this returns '
-    + 'the original animation. Use qq2_get_image to see the preview, or qq2_read_file to read text.',
+    + 'and a Cortico log: handle you can pass to another tool, such as devshop_start. Image originals, '
+    + 'including animated GIFs, are handed off as binary files. Use qq2_get_image to see the preview, or qq2_read_file to read text.',
   tags: ['read'],
   parameters: {
     type: 'object',
@@ -2914,11 +2914,11 @@ export class QQ2World implements World {
             ? await this.files?.readOriginal(id)
             : await this.readOriginalImage(id);
           if (!original) return { text: `取不到 ${id} 的原件。请检查编号或 QQ2 缓存。`, failed: true };
-          // Core 会把 image/* 附件送给视觉模型。GIF 原件用二进制句柄交接，保留文件名。
-          const mime = original.mime === 'image/gif' || isGif(original.bytes) ? 'application/octet-stream' : original.mime;
+          // Core 会把 image/* 附件送给视觉模型，原图交接使用二进制句柄。
+          const asBinary = original.mime.startsWith('image/') || isGif(original.bytes);
           return {
             text: `已取回 ${id} 的原件「${original.name}」（${formatBytes(original.bytes.byteLength)}）。可将下方 log: 句柄和文件名交给需要原件的工具。`,
-            blobs: [{ ...original, mime, fallbackText: `QQ 原件 ${id}` }],
+            blobs: [{ ...original, mime: asBinary ? 'application/octet-stream' : original.mime, fallbackText: `QQ 原件 ${id}` }],
           };
         } catch (err) {
           return { text: `取回 ${id} 失败：${err instanceof Error ? err.message : String(err)}`, failed: true };
