@@ -40,7 +40,7 @@ export async function downloadImageBytes(
   }
 }
 
-export function pickImageMime(bytes: Uint8Array, contentType: string | null, name: string): string {
+export function detectImageMime(bytes: Uint8Array): string | undefined {
   const startsWith = (signature: readonly number[], offset = 0) =>
     signature.every((byte, i) => bytes[offset + i] === byte);
   if (isGif(bytes)) return 'image/gif';
@@ -48,6 +48,12 @@ export function pickImageMime(bytes: Uint8Array, contentType: string | null, nam
   if (startsWith([0xff, 0xd8, 0xff])) return 'image/jpeg';
   if (startsWith([0x52, 0x49, 0x46, 0x46]) && startsWith([0x57, 0x45, 0x42, 0x50], 8)) return 'image/webp';
   if (startsWith([0x42, 0x4d])) return 'image/bmp';
+  return undefined;
+}
+
+export function pickImageMime(bytes: Uint8Array, contentType: string | null, name: string): string {
+  const detected = detectImageMime(bytes);
+  if (detected) return detected;
   const mime = contentType?.split(';')[0].trim().toLowerCase();
   if (mime?.startsWith('image/')) return mime === 'image/jpg' ? 'image/jpeg' : mime;
   const ext = (name.split(/[?#]/)[0].match(/\.([a-zA-Z0-9]+)$/)?.[1] ?? '').toLowerCase();

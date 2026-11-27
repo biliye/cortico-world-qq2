@@ -94,6 +94,21 @@ const bmp = Buffer.from(
   '0000ff00',
   'hex',
 );
+// 1×1, uncompressed 8-bit grayscale TIFF.
+const tiff = Buffer.from(
+  '49492a00080000000900' +
+  '000104000100000001000000' + // ImageWidth
+  '010104000100000001000000' + // ImageLength
+  '020103000100000008000000' + // BitsPerSample
+  '030103000100000001000000' + // Compression
+  '060103000100000001000000' + // PhotometricInterpretation
+  '11010400010000007a000000' + // StripOffsets
+  '150103000100000001000000' + // SamplesPerPixel
+  '160104000100000001000000' + // RowsPerStrip
+  '170104000100000001000000' + // StripByteCounts
+  '000000007f', // No next image, then one pixel.
+  'hex',
+);
 const mislabeledText = Buffer.from('这是普通文本');
 
 /** 本地 HTTP 服务，提供图片和误标文件样例。 */
@@ -114,6 +129,11 @@ async function serveImage(png: Uint8Array): Promise<typeof imageServer> {
     }
     if (req.url === '/scan.bmp') {
       res.writeHead(200, { 'content-type': 'image/bmp' }).end(bmp);
+      return;
+    }
+    if (req.url === '/scan.tiff' || req.url === '/generic-tiff') {
+      const mime = req.url === '/scan.tiff' ? 'image/tiff' : 'application/octet-stream';
+      res.writeHead(200, { 'content-type': mime }).end(tiff);
       return;
     }
     if (req.url === '/wrong.png') {
@@ -464,14 +484,27 @@ describe('取图(真回路:真 HTTP 图床)', () => {
     expect(String(ev.text)).toContain('看这个');
   });
 
-  it('通用下载 MIME 的 PNG 保留实际格式和原文件名', async () => {
+  it.each(['photo.png', 'photo.jpg'])('通用下载 MIME 的 PNG 按实际格式交接，QQ 文件名为 %s', async (name) => {
     mock.emitGroupMessage({
       user_id: 111,
-      segments: [{ type: 'image', data: { url: imageServer.url('generic-image'), file: 'photo.png' } }],
+      segments: [{ type: 'image', data: { url: imageServer.url('generic-image'), file: name } }],
     });
     await waitUntil(() => host.messageCount() === 1);
     expect(blobsOf(lastMessage())[0]?.mime).toBe('image/png');
     await expectBinaryHandoff(mod, 'IMG-1', 'photo.png', pngBytes());
+  });
+
+  it.each([
+    { route: 'scan.tiff', originalName: 'scan.tiff', exportedName: 'scan.tiff' },
+    { route: 'generic-tiff', originalName: 'scan.tiff', exportedName: 'scan.tiff' },
+    { route: 'generic-tiff', originalName: undefined, exportedName: 'IMG-1.img' },
+  ])('签名未识别时交接文件名为 $exportedName（$route）', async ({ route, originalName, exportedName }) => {
+    mock.emitGroupMessage({
+      user_id: 111,
+      segments: [{ type: 'image', data: { url: imageServer.url(route), file: originalName } }],
+    });
+    await waitUntil(() => host.messageCount() === 1);
+    await expectBinaryHandoff(mod, 'IMG-1', exportedName, tiff);
   });
 
   it.each([

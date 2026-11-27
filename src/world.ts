@@ -54,7 +54,7 @@ import {
 } from './onebot/conversation.ts';
 import { OneBotDriver, type OneBotEvent } from './onebot/driver.ts';
 import { HISTORY_TOOL_DECLS, createHistoryTools } from './onebot/history-tools.ts';
-import { MIME_EXT, pickImageMime } from './onebot/image-download.ts';
+import { detectImageMime, MIME_EXT } from './onebot/image-download.ts';
 import {
   buildOutgoing,
   makeImagePolicy,
@@ -274,7 +274,8 @@ const GET_ATTACHMENT_DECL: Omit<ToolDef, 'handler'> = {
   name: 'qq2_get_attachment',
   description:
     'Retrieve the original bytes of a QQ attachment by its IMG-N or FILE-N id. The receipt gives a filename '
-    + 'and a Cortico log: handle you can pass to another tool, such as devshop_start. Image originals, '
+    + 'and a Cortico log: handle you can pass to another tool, such as devshop_start. Choose an accepted '
+    + 'destination filename if that tool rejects the original name. Image originals, '
     + 'including animated GIFs, are handed off as binary files. Use qq2_get_image to see the preview, or qq2_read_file to read text.',
   tags: ['read'],
   parameters: {
@@ -3042,8 +3043,11 @@ export class QQ2World implements World {
     const original = await this.readStoredImage(id);
     if (!original) return null;
     const name = this.images?.filename(id) ?? this.vision?.filename(id);
-    const mime = pickImageMime(original.bytes, original.mime, name ?? id);
-    const ext = `.${MIME_EXT[mime] ?? 'img'}`;
+    const detectedMime = detectImageMime(original.bytes);
+    const mime = detectedMime ?? original.mime;
+    const extension = detectedMime && MIME_EXT[detectedMime];
+    if (!extension) return { bytes: original.bytes, mime, name: name ?? `${id}.img` };
+    const ext = `.${extension}`;
     const suffix = name ? extOf(name) : '';
     if (name && (suffix === ext || (ext === '.jpg' && suffix === '.jpeg'))) return { bytes: original.bytes, mime, name };
     const stem = name ? name.slice(0, name.length - suffix.length) : id;
