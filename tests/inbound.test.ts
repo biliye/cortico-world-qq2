@@ -530,8 +530,9 @@ describe('QQ 原生语音转写', () => {
     await waitUntil(() => host.texts('qq.transcript').length === 1);
     expect(host.last()).toContain('[语音] 下一段 [语音]');
     expect(host.last()).not.toContain('归属未知的转写');
+    const heading = host.last().replace(' [语音] 下一段 [语音]', '');
     expect(host.last('qq.transcript')).toBe(
-      '[本条消息含多段语音，转写对应的语音段未知] [语音转写 · 可能有错] 归属未知的转写',
+      `${heading} [本条消息含多段语音，转写对应的语音段未知] [语音转写 · 可能有错] 归属未知的转写`,
     );
     expect(host.pushed.filter(({ event }) => ['qq.message', 'qq.transcript'].includes(event.type))
       .map(({ event }) => [event.type, event.meta?.message_id]))
@@ -556,12 +557,44 @@ describe('QQ 原生语音转写', () => {
     });
     await waitUntil(() => host.texts('qq.transcript').length === 1);
     expect(host.last()).toContain('[语音 · 正在转写…]');
-    expect(host.last('qq.transcript')).toBe('[语音转写 · 可能有错] 私聊语音');
+    const heading = host.last().replace(' [语音 · 正在转写…]', '');
+    expect(host.last('qq.transcript')).toBe(`${heading} [语音转写 · 可能有错] 私聊语音`);
     expect(host.pushed.find((entry) => entry.event.type === 'qq.transcript')?.event.meta).toMatchObject({
       message_id: messageId,
       conv: { kind: 'private', id: PEER },
     });
     expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+  });
+
+  it('群聊和私聊结果乱序补发时，正文仍能对应原消息和发言人', async () => {
+    filesConfig.waitMs = 0;
+    const groupMessageId = 1001;
+    const privateMessageId = 2001;
+    mock.transcribeVoice = async (messageId) => {
+      if (messageId === groupMessageId) {
+        await waitUntil(() => host.texts('qq.transcript').length === 1);
+        return '群聊先发后返回';
+      }
+      await waitUntil(() => host.texts().length === 2);
+      return '私聊后发先返回';
+    };
+    mock.emitGroupMessage({ user_id: 111, card: '群友', message_id: groupMessageId, segments });
+    mock.emitRaw({
+      post_type: 'message',
+      message_type: 'private',
+      sub_type: 'friend',
+      user_id: PEER,
+      sender: { nickname: '私聊来客' },
+      message_id: privateMessageId,
+      message: segments,
+    });
+
+    await waitUntil(() => host.texts('qq.transcript').length === 2);
+    expect(host.texts('qq.transcript')).toEqual([
+      expect.stringMatching(/^#2001 \[私聊 \d{2}:\d{2}\] 私聊来客\(200002\): \[语音转写 · 可能有错\] 私聊后发先返回$/),
+      expect.stringMatching(/^#1001 \[群「深夜食堂」 \d{2}:\d{2}\] 群友\(111\): \[语音转写 · 可能有错\] 群聊先发后返回$/),
+    ]);
+    expect(mock.transcriptionRequests).toEqual([{ message_id: groupMessageId }, { message_id: privateMessageId }]);
   });
 
   it.each([

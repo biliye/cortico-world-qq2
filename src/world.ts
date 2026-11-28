@@ -1601,7 +1601,7 @@ export class QQ2World implements World {
     const inlineVoice = voice && recordCount === 1;
     const transcript = inlineVoice ? await withTimeout(voice, (this.cfg.files ?? FILES_DEFAULTS).waitMs) : null;
 
-    const { text, mentionedSelf } = renderIncoming(inbound.patched, {
+    const { text, heading, mentionedSelf } = renderIncoming(inbound.patched, {
       selfId,
       selfName,
       timezone: this.timezone,
@@ -1753,15 +1753,16 @@ export class QQ2World implements World {
     }
     if (voice && transcript === null) {
       void voice
-        .then((got) =>
-          host.pushEvent({
+        .then((got) => {
+          const result = recordCount > 1 ? `[本条消息含多段语音，转写对应的语音段未知] ${got}` : got;
+          return host.pushEvent({
             type: 'qq.transcript',
             ts: nowIso(this.timezone),
             source: EVENT_SOURCE,
-            text: recordCount > 1 ? `[本条消息含多段语音，转写对应的语音段未知] ${got}` : got,
+            text: `${heading} ${result}`,
             meta: messageRef,
-          }),
-        )
+          });
+        })
         .catch((e) => host.log.warn('事件投递失败', { err: String(e) }));
     }
   }
