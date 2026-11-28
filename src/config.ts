@@ -106,27 +106,15 @@ export const FILES_DEFAULTS: QQFilesConfig = {
   fetchTimeoutMs: 30_000,
 };
 
-/**
- * 收进来的**语音**(见 `src/asr.ts`)。**与 `worlds.qq2.voice` 是两回事**:那一组是出站嗓子
- * (她念出去的声音,走 MiniMax),这一组管的是**别人发来的语音条**转成文字(走本机 SenseVoice)。
- */
+/** 收到的 QQ 语音条通过 NapCat 请求 QQ 原生转写。 */
 export interface QQAsrConfig {
   enabled: boolean;
-  host: string;
-  port: number;
-  /** 识别语言。**默认 `zh`**:`auto` 会把中文猜成英文/日文(实测过),中文线必须指名 */
-  language: string;
   timeoutMs: number;
-  maxBytes: number;
 }
 
 export const ASR_DEFAULTS: QQAsrConfig = {
   enabled: true,
-  host: '127.0.0.1',
-  port: 50001,
-  language: 'zh',
   timeoutMs: 60_000,
-  maxBytes: 8 * 1024 * 1024,
 };
 
 export const QQ_DEFAULTS = {
@@ -406,7 +394,7 @@ export interface QQConfigSection {
   images: QQImagesConfig;
   /** 收进来的文件:下载、落盘、判文本、按段读 */
   files: QQFilesConfig;
-  /** 收进来的语音:本机 SenseVoice 转成文字(与出站嗓子的 `voice` 无关) */
+  /** 收到的语音使用 QQ 原生转写。 */
   asr: QQAsrConfig;
   vision: VisionConfig;
 }
@@ -541,8 +529,7 @@ export const QQ_INBOUND_CONFIG_GROUP: ConfigGroup = {
         multipleOf: 100,
         'x-suffix': 'ms',
         'x-hot': true,
-        description: '消息投出去之前等下载+读取的最长时间(与图片那项同一个理由:消息处理是串行的,'
-          + '不能让一个慢下载拖住后面所有消息)。超时先给一行「正在取」,内容稍后作为单独事件到达。',
+        description: '文件读取或语音转写在正文内等待的最长时间。超过后先投递占位，结果稍后补发。',
       },
       'worlds.qq2.files.readMaxChars': {
         type: 'integer',
@@ -558,29 +545,8 @@ export const QQ_INBOUND_CONFIG_GROUP: ConfigGroup = {
         type: 'boolean',
         title: '转写收到的语音',
         'x-hot': true,
-        description: '打开后,别人发来的语音条会被下载、送去本机 SenseVoice 转成文字交给她。'
-          + '正文里会写明这是**机器转写的、可能有错**。关掉则语音只留一行「[语音]」。',
-      },
-      'worlds.qq2.asr.host': {
-        type: 'string',
-        title: '转写服务地址',
-        'x-hot': true,
-        description: '本机 SenseVoice 服务,默认 127.0.0.1(与 hearing / pet / sensevoice 用的是同一个服务)。',
-      },
-      'worlds.qq2.asr.port': {
-        type: 'integer',
-        title: '转写服务端口',
-        minimum: 1,
-        maximum: 65_535,
-        multipleOf: 1,
-        'x-hot': true,
-        description: '默认 50001。',
-      },
-      'worlds.qq2.asr.language': {
-        type: 'string',
-        title: '识别语言',
-        'x-hot': true,
-        description: '默认 `zh`。**别改成 auto** ——实测 auto 会把中文猜成英文或日文,中文线上要指名。',
+        description: '打开后通过 NapCat 请求 QQ 原生转写，结果会标注「可能有错」。'
+          + '关掉则语音只显示「[语音]」。',
       },
       'worlds.qq2.asr.timeoutMs': {
         type: 'integer',
@@ -591,18 +557,7 @@ export const QQ_INBOUND_CONFIG_GROUP: ConfigGroup = {
         'x-scale': 1000,
         'x-suffix': 's',
         'x-hot': true,
-        description: '下载 + 转写一共允许多久;超时正文会写「转写服务没连上」之类的实话。',
-      },
-      'worlds.qq2.asr.maxBytes': {
-        type: 'integer',
-        title: '语音大小上限',
-        minimum: 65_536,
-        maximum: 52_428_800,
-        multipleOf: 65_536,
-        'x-scale': 1_048_576,
-        'x-suffix': 'MB',
-        'x-hot': true,
-        description: '超过这个大小的语音不转写(QQ 语音条通常只有几十 KB)。',
+        description: '等待 QQ 返回转写结果的总时限，包含重取结果的时间。超时会提示转写失败。',
       },
     },
   },

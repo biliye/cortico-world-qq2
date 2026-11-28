@@ -35,7 +35,7 @@ import { ImageLibrary, type PrecheckResult } from './images.ts';
 import { IMAGE_KIND_IDS, LabelStore, kindLabel, normalizeKind } from './labels.ts';
 import { FileLibrary, extOf, formatBytes, type FileRecord } from './files.ts';
 import { isGif } from './gif-preview.ts';
-import { InboundAsr, type AsrOutcome } from './asr.ts';
+import { transcribeVoice } from './asr.ts';
 import { SPLIT_DEFAULTS, VOICE_DEFAULTS, FILES_DEFAULTS, ASR_DEFAULTS, DIGEST_DEFAULTS, type QQImagesConfig, type QQSendSplitConfig, type QQVoiceConfig, type QQFilesConfig, type QQAsrConfig, type QQDigestConfig } from './config.ts';
 import { planVoiceBars, billableChars, type SayResult } from './voice.ts';
 
@@ -533,11 +533,6 @@ interface QQWorldDeps {
    * 于是「不发一个字节、不花一分钱」也能把 qq2_say 整条路走完。
    */
   say?: (text: string) => Promise<SayResult>;
-  /**
-   * 入站语音转写。生产是 `InboundAsr`(打本机 SenseVoice);测试注入替身,
-   * 于是「不碰那个服务」也能把「语音 → 文字」整条路走完。
-   */
-  asr?: { transcribe(url: string): Promise<AsrOutcome> };
 }
 
 /** 暂存的草稿(单槽,一进一出;不确认到本轮末即作废) */
@@ -564,11 +559,6 @@ interface ForwardNode {
   time?: number;
   userId?: string;
   messageType?: string;
-}
-
-/** 没赶上时限、要稍后另投的一条语音(见 prepareInbound 与 handleMessage 的收尾块)。 */
-interface DeferredVoice {
-  url: string;
 }
 
 /** 转发里登记好编号的一张图:正文给句柄,字节由 lookupForward 在后台取回。 */
@@ -626,9 +616,6 @@ export class QQ2World implements World {
    */
   private readonly files?: FileLibrary;
 
-  /** 收进来的**语音**转写(本机 SenseVoice)。与出站嗓子的 `say` 是两回事。 */
-  private readonly asr?: { transcribe(url: string): Promise<AsrOutcome> };
-
   /** 监听集合(可web端热改) */
   private watchedGroups: Set<number>;
   private watchedPrivates: Set<number>;
@@ -682,7 +669,7 @@ export class QQ2World implements World {
         log: this.log.child('images'),
       });
     }
-    // 文件库与转写器同样要落盘/要数据目录。库本身总是建(关掉只是不处理段,可以热开关);
+    // 文件库需要数据目录。库本身总是建(关掉只是不处理段,可以热开关);
     // 「去协议端要下载地址」那一步由 World 提供 —— 私聊走 get_private_file_url、
     // 群走 get_group_file_url,而那时 driver 才有(所以留成闭包,而不是构造时取)。
     if (cfg.dataDir) {
@@ -693,9 +680,6 @@ export class QQ2World implements World {
         resolveUrl: (ref) => this.fetchFileUrl(ref),
       });
     }
-    // 转写器:注入的替身优先(测试),否则要数据目录才建(与文件库同一个条件)。
-    this.asr = deps?.asr
-      ?? (cfg.dataDir ? new InboundAsr({ cfg: cfg.asr ?? ASR_DEFAULTS, log: this.log.child('asr') }) : undefined);
   }
 
   /**
@@ -1606,9 +1590,13 @@ export class QQ2World implements World {
         ? idn?.groups.get(conv.id)?.card || idn?.nickname || '你'
         : idn?.nickname || '你';
 
-    // 文件与语音:框架的渲染对这两类只给占位(`[file]` / `[语音]`),所以**渲染前把段换成
-    // 我们能读的文字段**。没赶上时限的先给一行「正在取」,内容稍后另投(见下面的收尾块)。
-    const inbound = await this.prepareInbound(msg, conv);
+    const inbound = await this.prepareInboundFiles(msg, conv);
+    const asr = this.cfg.asr ?? ASR_DEFAULTS;
+    const driver = this.driver;
+    const voice = asr.enabled && driver && msg.message?.some((seg) => seg.type === 'record')
+      ? transcribeVoice(driver, msg.message_id, asr.timeoutMs)
+      : undefined;
+    const transcript = voice ? await withTimeout(voice, (this.cfg.files ?? FILES_DEFAULTS).waitMs) : null;
 
     const { text, mentionedSelf } = renderIncoming(inbound.patched, {
       selfId,
@@ -1619,6 +1607,7 @@ export class QQ2World implements World {
       nameOf: (qq) => this.nameByUserId.get(qq),
       renderImage,
       renderJsonCard,
+      recordText: voice ? (transcript ?? '[语音 · 正在转写…]') : undefined,
     });
 
     const when =
@@ -1756,17 +1745,14 @@ export class QQ2World implements World {
         )
         .catch((e) => host.log.warn('事件投递失败', { err: String(e) }));
     }
-    for (const voice of inbound.deferredVoices) {
-      const asr = this.asr;
-      if (!asr) break;
-      void asr
-        .transcribe(voice.url)
+    if (voice && transcript === null) {
+      void voice
         .then((got) =>
           host.pushEvent({
             type: 'qq.transcript',
             ts: nowIso(this.timezone),
             source: EVENT_SOURCE,
-            text: got.text,
+            text: got,
             meta: { conv, message_id: msg.message_id },
           }),
         )
@@ -1774,46 +1760,29 @@ export class QQ2World implements World {
     }
   }
 
-  /**
-   * 把 `file` / `record` 段换成**我们能读的文字段**。
-   *
-   * 为什么是「换段」而不是走渲染回调:框架的 `renderIncoming` 只给了 `renderImage` /
-   * `renderJsonCard` 两个钩子 —— `file` 落进兜底分支输出 `[file]`;`record` 的 `recordText`
-   * 是**一个字符串**(所有语音共用同一个值,而我们要的是逐条转写)。所以在渲染前把这两个段
-   * 替换成文本段:不改框架,也不必去猜它的拼装结果再做字符串替换。
-   *
-   * 时限(与图片那条同一个理由):消息处理是**串行**的(`msgChain`),一次慢下载会拖住
-   * 后面所有消息。没赶上时限的,正文先给一行「正在取」,内容稍后另投。
-   */
-  private async prepareInbound(
+  /** 将文件段换成预览或占位。消息按序处理，慢下载的结果稍后补发。 */
+  private async prepareInboundFiles(
     msg: OneBotGroupMessage,
     conv: Conv,
-  ): Promise<{ patched: OneBotGroupMessage; deferredFiles: string[]; deferredVoices: DeferredVoice[] }> {
+  ): Promise<{ patched: OneBotGroupMessage; deferredFiles: string[] }> {
     const files = this.files;
-    const asr = this.asr;
+    const config = this.cfg.files ?? FILES_DEFAULTS;
     const deferredFiles: string[] = [];
-    const deferredVoices: DeferredVoice[] = [];
     const segments = msg.message ?? [];
-    const filesOn = !!files && (this.cfg.files ?? FILES_DEFAULTS).enabled;
-    const asrOn = !!asr && (this.cfg.asr ?? ASR_DEFAULTS).enabled;
-    if (!(filesOn || asrOn) || !segments.some((s) => (s.type === 'file' && filesOn) || (s.type === 'record' && asrOn))) {
-      return { patched: msg, deferredFiles, deferredVoices };
+    if (!files || !config.enabled || !segments.some((s) => s.type === 'file')) {
+      return { patched: msg, deferredFiles };
     }
-    const waitMs = (this.cfg.files ?? FILES_DEFAULTS).waitMs;
 
     const patched: Segment[] = [];
     for (const seg of segments) {
-      if (seg.type === 'file' && filesOn) {
-        patched.push({ type: 'text', data: { text: await this.inlineFile(files!, conv, seg, deferredFiles, waitMs) } });
-        continue;
-      }
-      if (seg.type === 'record' && asrOn) {
-        patched.push({ type: 'text', data: { text: await this.inlineVoice(asr!, seg, deferredVoices, waitMs) } });
+      if (seg.type === 'file') {
+        const text = await this.inlineFile(files, conv, seg, deferredFiles, config.waitMs);
+        patched.push({ type: 'text', data: { text } });
         continue;
       }
       patched.push(seg);
     }
-    return { patched: { ...msg, message: patched }, deferredFiles, deferredVoices };
+    return { patched: { ...msg, message: patched }, deferredFiles };
   }
 
   /** 一条文件的正文那一行;没赶上时限就先占位并把编号记下。 */
@@ -1847,21 +1816,6 @@ export class QQ2World implements World {
     deferred.push(id);
     const size = Number.isFinite(sizeNum) && sizeNum >= 0 ? formatBytes(sizeNum) : '大小未知';
     return `[文件 ${name || id} · ${size} · ${id} 正在取…]`;
-  }
-
-  /** 一条语音的正文那一行;没赶上时限就先占位(稍后那条事件同样带「转写·可能有错」)。 */
-  private async inlineVoice(
-    asr: { transcribe(url: string): Promise<AsrOutcome> },
-    seg: Segment,
-    deferred: DeferredVoice[],
-    waitMs: number,
-  ): Promise<string> {
-    const url = typeof seg.data?.url === 'string' ? seg.data.url : '';
-    if (!url) return '[语音](协议端没给下载地址)';
-    const got = await withTimeout(asr.transcribe(url), waitMs);
-    if (got) return got.text;
-    deferred.push({ url });
-    return '[语音 · 正在转写…]';
   }
 
   /**

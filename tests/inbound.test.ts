@@ -13,9 +13,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { nullLogger } from 'cortico/core/util.ts';
 import { LogBlobStore } from 'cortico/core/blobs.ts';
 import type { EventEnvelope, PushOptions, WorldHost } from 'cortico/core/types.ts';
-import { ASR_DEFAULTS, FILES_DEFAULTS, type QQFilesConfig } from '../src/config.ts';
+import { ASR_DEFAULTS, FILES_DEFAULTS, type QQAsrConfig, type QQFilesConfig } from '../src/config.ts';
 import { FileLibrary, formatBytes, renderFileText, sniffText } from '../src/files.ts';
-import { renderTranscription } from '../src/asr.ts';
 import { MockNapCat } from './helpers/mock-napcat.ts';
 import { QQ2World } from '../src/world.ts';
 
@@ -100,27 +99,6 @@ describe('大小怎么写给人看', () => {
     expect(formatBytes(12)).toBe('12 B');
     expect(formatBytes(240 * 1024)).toBe('240 KB');
     expect(formatBytes(60.7 * 1024 * 1024)).toBe('60.7 MB');
-  });
-});
-
-describe('语音转写的措辞(他定的那条:必须写明可能识别错)', () => {
-  it('拿到文字时带「转写 · 可能有错」', () => {
-    const got = renderTranscription({ text: '明天下午三点开会', language: 'zh' });
-    expect(got.ok).toBe(true);
-    expect(got.text).toContain('语音转写');
-    expect(got.text).toContain('可能有错');
-    expect(got.text).toContain('明天下午三点开会');
-  });
-
-  it('没转出文字时也照实说,不假装听到了', () => {
-    const got = renderTranscription({ text: '  ', language: 'zh' });
-    expect(got.ok).toBe(false);
-    expect(got.text).toContain('没转出文字');
-  });
-
-  it('情感不是中性才附上', () => {
-    expect(renderTranscription({ text: '好', emotion: 'HAPPY' }).text).toContain('HAPPY');
-    expect(renderTranscription({ text: '好', emotion: 'NEUTRAL' }).text).not.toContain('NEUTRAL');
   });
 });
 
@@ -354,6 +332,8 @@ let mock: MockNapCat;
 let mod: QQ2World;
 let host: RecordingHost;
 let dataDir: string;
+let asrConfig: QQAsrConfig;
+let filesConfig: QQFilesConfig;
 let fileServer: { url: (name: string) => string; server: Server };
 
 /** 一个真 HTTP 服务:按文件名给字节(都是文本,便于断言内容)。 */
@@ -384,24 +364,18 @@ async function waitUntil(check: () => boolean, timeoutMs = 6000): Promise<void> 
   throw new Error('等待超时');
 }
 
-/** 灌进去的那条语音的替身转写:走真渲染函数,于是措辞那一条也端到端验到了。 */
-const fakeAsr = {
-  async transcribe() {
-    return renderTranscription({ text: '明天下午三点开会', language: 'zh' });
-  },
-};
-
 beforeEach(async () => {
   mock = new MockNapCat({ port: 0, groupId: GROUP, selfId: 5000, selfNickname: 'bot', selfCard: 'botcard', groupName: '深夜食堂' });
   const port = await mock.start();
   host = new RecordingHost();
   dataDir = mkdtempSync(join(tmpdir(), 'qq2-inbound-'));
+  asrConfig = { ...ASR_DEFAULTS };
+  filesConfig = { ...FILES_DEFAULTS, waitMs: 5000 };
   fileServer = await serveFiles({
     'notes.txt': '哈喽哈喽',
     'fixture.pdf': '%PDF-1.5\n原件内容',
     // 500 行 × 约 40 字节 ≈ 20 KB,稳稳超过 8 KB 的内联线,于是走「前几行 + 编号」那条路
     'big.log': Array.from({ length: 500 }, (_, i) => `第 ${i + 1} 行 ${'填充内容'.repeat(5)}`).join('\n'),
-    'voice.amr': 'AMR-BYTES-PLACEHOLDER',
   });
   mod = new QQ2World(
     {
@@ -410,10 +384,9 @@ beforeEach(async () => {
       privates: [PEER],
       token: '',
       dataDir,
-      files: { ...FILES_DEFAULTS, waitMs: 5000 },
-      asr: { ...ASR_DEFAULTS },
+      files: filesConfig,
+      asr: asrConfig,
     },
-    { asr: fakeAsr },
   );
   await mod.start(host.host);
   await mod.waitReady();
@@ -524,29 +497,100 @@ describe('文件消息真的走到推送点(真回路)', () => {
     expect(body).toContain('第 500 行');
   });
 
-  it('语音段:正文是转写文字,而且写着「可能有错」', async () => {
-    mock.emitGroupMessage({
-      user_id: 111,
-      segments: [{ type: 'record', data: { file: 'v.amr', url: fileServer.url('voice.amr'), file_size: '20' } }],
-    });
-    await waitUntil(() => host.texts().length === 1);
-    const text = host.last();
-    expect(text).not.toContain('[语音]');
-    expect(text).toContain('语音转写');
-    expect(text).toContain('可能有错');
-    expect(text).toContain('明天下午三点开会');
-  });
-
   it('关掉文件开关:file 段退回框架的占位(不动既有行为)', async () => {
-    await mod.stop();
-    await mock.close();
-    const port = await mock.start();
-    mod = new QQ2World({ wsUrl: `ws://127.0.0.1:${port}`, groups: [GROUP], privates: [PEER], token: '', dataDir, files: { ...FILES_DEFAULTS, enabled: false } }, { asr: fakeAsr });
-    await mod.start(host.host);
-    await mod.waitReady();
-    host.pushed.length = 0;
+    filesConfig.enabled = false;
     mock.emitGroupMessage({ user_id: 111, segments: [{ type: 'file', data: { file: 'a.txt', file_id: 'f', url: fileServer.url('notes.txt') } }] });
     await waitUntil(() => host.texts().length === 1);
     expect(host.last()).toContain('[file]');
+  });
+});
+
+describe('QQ 原生语音转写', () => {
+  const segments = [{ type: 'record', data: { file: 'v.amr' } }];
+
+  it('群聊按消息号转写无下载地址的语音，快回执写入正文', async () => {
+    mock.transcribeVoice = () => ' 明天下午三点开会 ';
+    const messageId = mock.emitGroupMessage({ user_id: 111, segments });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('[语音转写 · 可能有错] 明天下午三点开会');
+    expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+    expect(host.texts('qq.transcript')).toEqual([]);
+  });
+
+  it('私聊慢回执稍后投递，并复用已经发出的请求', async () => {
+    filesConfig.waitMs = 20;
+    mock.transcribeVoice = async () => {
+      await waitUntil(() => host.texts().length === 1);
+      return '私聊语音';
+    };
+    const messageId = 218;
+    mock.emitRaw({
+      post_type: 'message',
+      message_type: 'private',
+      sub_type: 'friend',
+      user_id: PEER,
+      message_id: messageId,
+      message: segments,
+    });
+    await waitUntil(() => host.texts('qq.transcript').length === 1);
+    expect(host.last()).toContain('[语音 · 正在转写…]');
+    expect(host.last('qq.transcript')).toBe('[语音转写 · 可能有错] 私聊语音');
+    expect(host.pushed.find((entry) => entry.event.type === 'qq.transcript')?.event.meta).toMatchObject({
+      message_id: messageId,
+      conv: { kind: 'private', id: PEER },
+    });
+    expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+  });
+
+  it('QQ 尚未写回结果时重取同一条消息的转写', async () => {
+    mock.transcribeVoice = () => {
+      if (mock.transcriptionRequests.length === 1) throw new Error('获取语音转文字结果失败');
+      return '稍后写回的文字';
+    };
+    const messageId = mock.emitGroupMessage({ user_id: 111, segments });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('[语音转写 · 可能有错] 稍后写回的文字');
+    expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }, { message_id: messageId }]);
+  });
+
+  it('NapCat 不支持时保留消息并说明原因', async () => {
+    const messageId = mock.emitGroupMessage({ user_id: 111, segments });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('[语音 · NapCat 不支持 QQ 原生转写]');
+    expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+  });
+
+  it('收到空文本且重取时间不足时说明没转出文字', async () => {
+    asrConfig.timeoutMs = 1000;
+    mock.transcribeVoice = () => '  ';
+    const messageId = mock.emitGroupMessage({ user_id: 111, segments });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('[语音 · QQ 转写失败（没转出文字）]');
+    expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+  });
+
+  it('调用超时后补发失败原因，后续消息照常投递', async () => {
+    filesConfig.waitMs = 0;
+    asrConfig.timeoutMs = 1000;
+    mock.transcribeVoice = async () => {
+      await waitUntil(() => host.texts('qq.transcript').length === 1);
+      return '已超时的回执';
+    };
+    const messageId = mock.emitGroupMessage({ user_id: 111, segments });
+    mock.emitGroupMessage({ user_id: 111, text: '第二条消息' });
+    await waitUntil(() => host.texts().length === 2);
+    expect(host.texts()[0]).toContain('[语音 · 正在转写…]');
+    expect(host.texts()[1]).toContain('第二条消息');
+    await waitUntil(() => host.texts('qq.transcript').length === 1);
+    expect(host.last('qq.transcript')).toContain('调用超时');
+    expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+  });
+
+  it('转写关闭时保留普通语音占位', async () => {
+    asrConfig.enabled = false;
+    mock.emitGroupMessage({ user_id: 111, segments });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('[语音]');
+    expect(mock.transcriptionRequests).toEqual([]);
   });
 });

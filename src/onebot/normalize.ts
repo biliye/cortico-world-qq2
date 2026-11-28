@@ -295,7 +295,7 @@ export function renderIncoming(
         parts.push({ text: renderImage(data), isToken: true });
         break;
       }
-      // 语音条的音频不随消息到达;转写文本由 World 另发事件。
+      // World 提供已完成的转写或占位，较慢的结果另发事件。
       case 'record': {
         parts.push({ text: ctx.recordText ?? '[语音]', isToken: true });
         break;
