@@ -26,6 +26,8 @@ export interface OutboxEntry {
   message_id?: number;
 }
 
+type MockTranscription = string | { retcode: number; message?: string; wording?: string };
+
 export class MockNapCat {
   readonly opts: Required<Omit<MockNapCatOptions, 'port' | 'token'>> & {
     token?: string;
@@ -36,7 +38,7 @@ export class MockNapCat {
   /** send_group_msg调用记录(测试断言用) */
   readonly outbox: OutboxEntry[] = [];
   readonly transcriptionRequests: Record<string, unknown>[] = [];
-  transcribeVoice?: (messageId: unknown) => Promise<string> | string;
+  transcribeVoice?: (messageId: unknown) => Promise<MockTranscription> | MockTranscription;
   /** 测试回执延迟：消息已收下，但暂不返回 echo。 */
   holdSendReplies = false;
   private heldSendReplies: Array<() => void> = [];
@@ -175,8 +177,11 @@ export class MockNapCat {
           return;
         }
         void Promise.resolve().then(() => transcribe(params.message_id)).then(
-          (text) => ok({ text }),
-          (error) => fail(1200, String(error)),
+          (result) => {
+            if (typeof result === 'string') ok({ text: result });
+            else this.send(ws, { status: 'failed', data: null, echo, ...result });
+          },
+          (error) => fail(1200, error instanceof Error ? error.message : String(error)),
         );
         return;
       }

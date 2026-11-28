@@ -106,7 +106,7 @@ export const FILES_DEFAULTS: QQFilesConfig = {
   fetchTimeoutMs: 30_000,
 };
 
-/** 收到的 QQ 语音条通过 NapCat 请求 QQ 原生转写。 */
+/** 收到的 QQ 语音条通过 OneBot 请求 QQ 原生转写。 */
 export interface QQAsrConfig {
   enabled: boolean;
   timeoutMs: number;
@@ -545,7 +545,7 @@ export const QQ_INBOUND_CONFIG_GROUP: ConfigGroup = {
         type: 'boolean',
         title: '转写收到的语音',
         'x-hot': true,
-        description: '打开后通过 NapCat 请求 QQ 原生转写，结果会标注「可能有错」。'
+        description: '打开后通过 OneBot 请求 QQ 原生转写，结果会标注「可能有错」。'
           + '关掉则语音只显示「[语音]」。',
       },
       'worlds.qq2.asr.timeoutMs': {

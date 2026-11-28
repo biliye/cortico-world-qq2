@@ -517,6 +517,28 @@ describe('QQ 原生语音转写', () => {
     expect(host.texts('qq.transcript')).toEqual([]);
   });
 
+  it('多段语音各自保留占位，只补发一份消息级转写', async () => {
+    mock.transcribeVoice = () => '归属未知的转写';
+    const messageId = mock.emitGroupMessage({
+      user_id: 111,
+      segments: [
+        { type: 'record', data: { file: 'first.amr' } },
+        { type: 'text', data: { text: '下一段' } },
+        { type: 'record', data: { file: 'second.amr' } },
+      ],
+    });
+    await waitUntil(() => host.texts('qq.transcript').length === 1);
+    expect(host.last()).toContain('[语音] 下一段 [语音]');
+    expect(host.last()).not.toContain('归属未知的转写');
+    expect(host.last('qq.transcript')).toBe(
+      '[本条消息含多段语音，转写对应的语音段未知] [语音转写 · 可能有错] 归属未知的转写',
+    );
+    expect(host.pushed.filter(({ event }) => ['qq.message', 'qq.transcript'].includes(event.type))
+      .map(({ event }) => [event.type, event.meta?.message_id]))
+      .toEqual([['qq.message', messageId], ['qq.transcript', messageId]]);
+    expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+  });
+
   it('私聊慢回执稍后投递，并复用已经发出的请求', async () => {
     filesConfig.waitMs = 20;
     mock.transcribeVoice = async () => {
@@ -542,9 +564,13 @@ describe('QQ 原生语音转写', () => {
     expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
   });
 
-  it('QQ 尚未写回结果时重取同一条消息的转写', async () => {
+  it.each([
+    ['NapCat 暂未取到结果', { retcode: 1200, message: '获取语音转文字结果失败' }],
+    ['SnowLuma 未收到结果推送', { retcode: 100, wording: '语音转文字超时（未收到结果推送）' }],
+    ['协议端返回空文本', ' '],
+  ] as const)('%s时重取同一条消息的转写', async (_scenario, firstResult) => {
     mock.transcribeVoice = () => {
-      if (mock.transcriptionRequests.length === 1) throw new Error('获取语音转文字结果失败');
+      if (mock.transcriptionRequests.length === 1) return firstResult;
       return '稍后写回的文字';
     };
     const messageId = mock.emitGroupMessage({ user_id: 111, segments });
@@ -553,10 +579,29 @@ describe('QQ 原生语音转写', () => {
     expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }, { message_id: messageId }]);
   });
 
-  it('NapCat 不支持时保留消息并说明原因', async () => {
+  it('协议端不支持时保留消息并说明原因', async () => {
     const messageId = mock.emitGroupMessage({ user_id: 111, segments });
     await waitUntil(() => host.texts().length === 1);
-    expect(host.last()).toContain('[语音 · NapCat 不支持 QQ 原生转写]');
+    expect(host.last()).toContain('[语音 · 当前 OneBot 实现不支持 QQ 原生转写]');
+    expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+  });
+
+  it.each(['消息不存在或已被撤回', 'ptt translate failed: error=9'])(
+    'SnowLuma 返回 %s 时显示 wording，直接结束转写',
+    async (wording) => {
+      mock.transcribeVoice = () => ({ retcode: 100, wording });
+      const messageId = mock.emitGroupMessage({ user_id: 111, segments });
+      await waitUntil(() => host.texts().length === 1);
+      expect(host.last()).toContain(`[语音 · QQ 转写失败（fetch_ptt_text: retcode=100 ${wording}）]`);
+      expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
+    },
+  );
+
+  it('NapCat 返回消息不存在时保留 message，直接结束转写', async () => {
+    mock.transcribeVoice = () => ({ retcode: 1200, message: '消息不存在' });
+    const messageId = mock.emitGroupMessage({ user_id: 111, segments });
+    await waitUntil(() => host.texts().length === 1);
+    expect(host.last()).toContain('fetch_ptt_text: retcode=1200 消息不存在');
     expect(mock.transcriptionRequests).toEqual([{ message_id: messageId }]);
   });
 

@@ -1593,10 +1593,13 @@ export class QQ2World implements World {
     const inbound = await this.prepareInboundFiles(msg, conv);
     const asr = this.cfg.asr ?? ASR_DEFAULTS;
     const driver = this.driver;
-    const voice = asr.enabled && driver && msg.message?.some((seg) => seg.type === 'record')
+    const recordCount = msg.message?.filter((seg) => seg.type === 'record').length ?? 0;
+    const voice = asr.enabled && driver && recordCount > 0
       ? transcribeVoice(driver, msg.message_id, asr.timeoutMs)
       : undefined;
-    const transcript = voice ? await withTimeout(voice, (this.cfg.files ?? FILES_DEFAULTS).waitMs) : null;
+    // OneBot 只按消息号返回一份文字。多段语音的结果随整条消息补发，避免认错语音段。
+    const inlineVoice = voice && recordCount === 1;
+    const transcript = inlineVoice ? await withTimeout(voice, (this.cfg.files ?? FILES_DEFAULTS).waitMs) : null;
 
     const { text, mentionedSelf } = renderIncoming(inbound.patched, {
       selfId,
@@ -1607,7 +1610,7 @@ export class QQ2World implements World {
       nameOf: (qq) => this.nameByUserId.get(qq),
       renderImage,
       renderJsonCard,
-      recordText: voice ? (transcript ?? '[语音 · 正在转写…]') : undefined,
+      recordText: inlineVoice ? (transcript ?? '[语音 · 正在转写…]') : undefined,
     });
 
     const when =
@@ -1752,7 +1755,7 @@ export class QQ2World implements World {
             type: 'qq.transcript',
             ts: nowIso(this.timezone),
             source: EVENT_SOURCE,
-            text: got,
+            text: recordCount > 1 ? `[本条消息含多段语音，转写对应的语音段未知] ${got}` : got,
             meta: { conv, message_id: msg.message_id },
           }),
         )

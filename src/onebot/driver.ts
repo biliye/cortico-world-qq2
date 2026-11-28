@@ -357,9 +357,12 @@ export class OneBotDriver {
       if (retcode === 0 || status === 'ok' || status === 'async') {
         call.resolve(msg.data);
       } else {
+        const detail = [msg.message, msg.wording]
+          .find((value): value is string => typeof value === 'string' && value.trim() !== '')
+          ?.trim();
         call.reject(
           new OneBotApiError(
-            `${call.action}: retcode=${retcode}${msg.message ? ` ${String(msg.message)}` : ''}`,
+            `${call.action}: retcode=${retcode}${detail ? ` ${detail}` : ''}`,
             retcode,
           ),
         );
