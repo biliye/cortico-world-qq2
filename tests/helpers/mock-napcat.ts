@@ -26,6 +26,8 @@ export interface OutboxEntry {
   message_id?: number;
 }
 
+type MockTranscription = string | { retcode: number; message?: string; wording?: string };
+
 export class MockNapCat {
   readonly opts: Required<Omit<MockNapCatOptions, 'port' | 'token'>> & {
     token?: string;
@@ -35,6 +37,8 @@ export class MockNapCat {
 
   /** send_group_msg调用记录(测试断言用) */
   readonly outbox: OutboxEntry[] = [];
+  readonly transcriptionRequests: Record<string, unknown>[] = [];
+  transcribeVoice?: (messageId: unknown) => Promise<MockTranscription> | MockTranscription;
   /** 测试回执延迟：消息已收下，但暂不返回 echo。 */
   holdSendReplies = false;
   private heldSendReplies: Array<() => void> = [];
@@ -163,6 +167,22 @@ export class MockNapCat {
         const response = this.forwardById.get(String(params.message_id ?? params.id));
         if (response === undefined) fail(1404, '转发消息不存在');
         else ok(Array.isArray(response) ? { messages: response } : response);
+        return;
+      }
+      case 'fetch_ptt_text': {
+        this.transcriptionRequests.push(params);
+        const transcribe = this.transcribeVoice;
+        if (!transcribe) {
+          fail(1404, '不支持的api');
+          return;
+        }
+        void Promise.resolve().then(() => transcribe(params.message_id)).then(
+          (result) => {
+            if (typeof result === 'string') ok({ text: result });
+            else this.send(ws, { status: 'failed', data: null, echo, ...result });
+          },
+          (error) => fail(1200, error instanceof Error ? error.message : String(error)),
+        );
         return;
       }
       // 文件下载地址(NapCat 扩展动作)。私聊 file 段**段里没有 url**(实测),就靠这一步;

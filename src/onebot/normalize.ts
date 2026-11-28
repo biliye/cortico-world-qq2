@@ -168,6 +168,8 @@ export interface RenderContext {
 interface RenderedIncoming {
   /** 例: `#842485102 [群「茶话会」 21:32] 阿明(12345): 在吗` */
   text: string;
+  /** 含消息号、会话和发言人，供补发内容沿用。 */
+  heading: string;
   /** 消息里@了bot自己(→urgent立即投递) */
   mentionedSelf: boolean;
 }
@@ -295,7 +297,7 @@ export function renderIncoming(
         parts.push({ text: renderImage(data), isToken: true });
         break;
       }
-      // 语音条的音频不随消息到达;转写文本由 World 另发事件。
+      // World 提供已完成的转写或占位，较慢的结果另发事件。
       case 'record': {
         parts.push({ text: ctx.recordText ?? '[语音]', isToken: true });
         break;
@@ -333,8 +335,10 @@ export function renderIncoming(
   // 行首的 `#<message_id>` 是这条消息在 QQ 上的真身份:引用回复哪条,就把这个
   // 号回传给 draft(reply_to)。它由 World 渲染(平台自己的 ID),不是 core 的存储位置。
   const idTag = msg.message_id !== undefined ? `#${msg.message_id} ` : '';
+  const heading = `${idTag}[${ctx.convLabel} ${shortTime(ctx.timezone, when)}] ${displayName}(${msg.user_id}):`;
   return {
-    text: `${idTag}[${ctx.convLabel} ${shortTime(ctx.timezone, when)}] ${displayName}(${msg.user_id}): ${body}`,
+    text: `${heading} ${body}`,
+    heading,
     mentionedSelf,
   };
 }
