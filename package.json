@@ -1,8 +1,8 @@
 {
   "name": "cortico-world-qq2",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
-  "description": "Coopanion / Cortico 的 QQ World，连接 NapCat OneBot 11，支持群聊四档、历史查找、图片与发送回执。",
+  "description": "Coopanion / Cortico 的 QQ World，连接 NapCat 或 SnowLuma 的 OneBot 11，支持群聊四档、历史查找、图片与发送回执。",
   "author": "筆離嘢",
   "license": "MIT",
   "repository": {
