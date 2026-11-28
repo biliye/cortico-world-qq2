@@ -1639,6 +1639,12 @@ export class QQ2World implements World {
     }
     // 私聊照常合批;群里被@立即投递
     const trigger = conv.kind === 'group' && mentionedSelf ? 'flush' as const : 'debounce' as const;
+    // 补发的转写也沿用原消息的直接 @ 标记，交给群聊模式决定是否投递。
+    const messageRef = {
+      conv,
+      message_id: msg.message_id,
+      ...(mentionedSelf ? { [MENTION_META_KEY]: true } : {}),
+    };
     const env = await host.pushEvent(
       {
         type: 'qq.message',
@@ -1647,12 +1653,9 @@ export class QQ2World implements World {
         text,
         senderKey,
         meta: {
-          message_id: msg.message_id,
+          ...messageRef,
           user_id: msg.user_id,
           sender_name: displayName,
-          conv,
-          // 点名说她(@):睡眠模式下它是唯一的唤醒依据(见 modes.ts 的 planDelivery)
-          ...(mentionedSelf ? { [MENTION_META_KEY]: true } : {}),
         },
         ...(blobs.length ? { blobs } : {}),
       },
@@ -1756,7 +1759,7 @@ export class QQ2World implements World {
             ts: nowIso(this.timezone),
             source: EVENT_SOURCE,
             text: recordCount > 1 ? `[本条消息含多段语音，转写对应的语音段未知] ${got}` : got,
-            meta: { conv, message_id: msg.message_id },
+            meta: messageRef,
           }),
         )
         .catch((e) => host.log.warn('事件投递失败', { err: String(e) }));

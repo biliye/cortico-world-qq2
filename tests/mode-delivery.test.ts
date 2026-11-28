@@ -257,6 +257,32 @@ describe('群消息按模式投递(真回路)', () => {
     expect(host.pushed[host.pushed.length - 1]?.event.text).toContain('在吗');
   });
 
+  it.each([
+    { name: '直接 @', target: String(SELF), options: { trigger: 'flush' } },
+    { name: '@全体', target: 'all', options: { deliver: false } },
+    { name: '没有 @', target: undefined, options: { deliver: false } },
+  ])('睡眠时$name 的多段语音与补发转写采用同一投递规则', async ({ target, options }) => {
+    await reboot('sleep');
+    mock.transcribeVoice = () => '新语音的转写';
+    const messageId = mock.emitGroupMessage({
+      user_id: 111,
+      segments: [
+        ...(target ? [{ type: 'at', data: { qq: target } }] : []),
+        { type: 'record', data: { file: 'first.amr' } },
+        { type: 'record', data: { file: 'second.amr' } },
+      ],
+    });
+
+    await waitUntil(() => host.pushed.some(({ event }) => event.type === 'qq.transcript'));
+    const original = host.pushed.find(({ event }) => event.type === 'qq.message');
+    const transcript = host.pushed.find(({ event }) => event.type === 'qq.transcript');
+    for (const entry of [original, transcript]) {
+      expect(entry?.event.meta?.message_id).toBe(messageId);
+      expect(entry?.opts).toEqual(options);
+    }
+    expect(transcript?.event.text).toContain('新语音的转写');
+  });
+
   it('睡眠只作用于群:私聊照旧合批', async () => {
     await reboot('sleep');
     mock.emitPrivateMessage({ user_id: PEER, text: '在忙吗' });
